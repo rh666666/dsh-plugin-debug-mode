@@ -91,10 +91,10 @@
 | [scripts/build-client.mjs](./scripts/build-client.mjs) | 把源码包成 `__ModuleLoader__` 产物（零第三方依赖） |
 | [lib/client.js](./lib/client.js) | 【生成物】客户端产物，勿手改 |
 | [lib/index.js](./lib/index.js) | 宿主半入口（当前只有 `name` / `inject` / `apply` 骨架） |
-| [test/protocol.test.mjs](./test/protocol.test.mjs) · [test/client-bundle.test.mjs](./test/client-bundle.test.mjs) | 18 个守卫测试，全绿（含一个迷你 hooks 渲染器） |
+| [test/protocol.test.mjs](./test/protocol.test.mjs) · [test/client-bundle.test.mjs](./test/client-bundle.test.mjs) | 19 个守卫测试，全绿（含一个迷你 hooks 渲染器） |
 
 未落地（按 DESIGN.md §14 路线图的 M1–M6）：`/debug` 命令与票据闸门、5 个信号工具、
-日志读写与摘要、唤醒闭环、面板的按钮接线与样式、清理对账。
+日志读写与摘要、唤醒闭环、面板的按钮接线与样式、残留扫描器（R1/R2）。
 
 ---
 
@@ -107,6 +107,8 @@ debug-mode/
 ├── README.md                  ← 面向用户的安装与简介
 ├── package.json               ← dsh.bundle.patch + dsh.client + exports
 ├── cordis.patch.yml           ← bundle 挂载声明
+├── .gitattributes             ← 行尾锁 LF；lib/client.js 标为 generated
+├── .gitignore                 ← 忽略 node_modules 与被调试项目产生的 .dsh/
 ├── lib/
 │   ├── index.js               ← 宿主半入口：注册命令/工具/提示词/路由
 │   ├── client.js              ← 【生成物】客户端产物，勿手改（由 scripts/build-client.mjs 生成）
@@ -152,6 +154,11 @@ node --test test/*.test.mjs        # 跑全部单测（会先自动重新构建�
 
 > 注意：**不要**写 `node --test test/`。Node 24 会把目录参数当成模块名解析而报
 > `Cannot find module ...\test`；必须用上面这个 glob 形式（或显式文件路径）。
+>
+> **判断行尾时不要把 `git show` 接进 PowerShell 管道。** PowerShell 的 `Out-String`
+> 会把管道里的 LF 转成 CRLF，于是每个文件看起来都「含 CR」——这是假阳性，会让人
+> 白改一轮。要按**字节**判断（`git show` 写进文件后数 `0x0D`）。
+> 本仓库的 `.gitattributes` 已把行尾锁成 LF，正常情况不需要人工干预。
 
 依赖安装（若将来需要）：使用 DSH 运行时自带的 Node 与 pnpm，
 不要用系统里可能存在的其它版本（见 `load_workspace_dependencies` 返回的路径）。
