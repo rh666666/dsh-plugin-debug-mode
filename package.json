@@ -1,0 +1,77 @@
+{
+  "name": "dsh-plugin-debug-mode",
+  "version": "0.0.1",
+  "description": "DSH 插件的 Cursor-Agent 式 Debug 模式：以固定探针日志协议驱动 Agent 在代码库中主动埋点，把日志落到 .dsh/debug-mode/，调试结束后由用户在弹出的面板中选择「问题已解决」或「问题复现，需要进一步修复」。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "debug",
+    "probe",
+    "logging"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.1.5-rc.1"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./probe": {
+      "default": "./lib/probe.mjs"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "scripts",
+    "assets",
+    "cordis.patch.yml",
+    "AGENTS.md",
+    "DESIGN.md",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node scripts/build-client.mjs && node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-runtime": ">=0.1.5-rc.1",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.1.5-rc.1",
+    "@deepseek-ai/dsh-host-webserver": ">=0.1.5-rc.1",
+    "react": "^18.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-runtime": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-slots": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-host-webserver": {
+      "optional": true
+    }
+  },
+  "license": "MIT"
+}

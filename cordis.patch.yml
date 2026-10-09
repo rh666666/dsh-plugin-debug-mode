@@ -1,0 +1,15 @@
+# ============================================================================
+# dsh-plugin-debug-mode —— DSH bundle patch（挂载声明）
+# ============================================================================
+# 本文件把插件插入 profile 的配置树。宿主半（lib/index.js）提供调试服务、
+# Agent 侧信号工具、系统提示词段落与日志读写；浏览器半（lib/client.js，
+# 由 package.json 的 dsh.client 清单加载）画面板并把用户选择回传宿主。
+#
+# 安装：
+#   dsh plugin --profile web add dsh-plugin-debug-mode
+#   本地开发：dsh plugin --profile web add link:<本目录绝对路径>
+# ============================================================================
+
+- insert:
+    - id: debug-mode
+      name: dsh-plugin-debug-mode

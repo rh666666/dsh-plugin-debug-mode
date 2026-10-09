@@ -1,0 +1,22 @@
+# 行尾规范化：仓库内一律 LF。
+#
+# 为什么要显式写：Windows 上 `core.autocrlf=true` 会把检出的文件变成 CRLF，
+# 而这个项目里有 .mjs/.js 可执行脚本、且探针桩会被复制进**别人**的项目里执行，
+# 混入 CRLF 会在 shebang / 正则 / 快照对比上制造跨平台噪声。
+# `eol=lf` 让仓库内容与检出内容都保持 LF，不受各人 autocrlf 设置影响。
+* text=auto eol=lf
+
+# 二进制：不要做任何行尾或编码转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.mp3 binary
+*.pdf binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# 生成物：语法上标成 generated，让 diff / review 工具知道它不该手改。
+lib/client.js linguist-generated=true
