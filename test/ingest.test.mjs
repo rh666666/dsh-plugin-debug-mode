@@ -19,8 +19,8 @@ import { test } from 'node:test'
 import { createContext, runInContext } from 'node:vm'
 
 import { DebugService, normalizeProbePayload, LOG_WARN_BYTES } from '../lib/debug-service.js'
-import { renderBrowserStub } from '../lib/probe-template.js'
-import { RECORD_FIELDS, parseLog } from '../lib/protocol.js'
+import { renderBrowserStub, renderHttpGuide } from '../lib/probe-template.js'
+import { RECORD_FIELDS, byteLength, parseLog } from '../lib/protocol.js'
 import { ROUTE_PREFIX, registerRoutes } from '../lib/routes.js'
 import { createFakeContext, createWorkspace } from './helpers.mjs'
 
@@ -104,7 +104,8 @@ test('ingestProbe：落盘用同一份协议，task 由宿主写死，ts 缺失�
 
     const raw = (await readFile(join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash, `${started.hash}.log`), 'utf8')).trimEnd()
     const parsed = JSON.parse(raw)
-    assert.deepEqual(Object.keys(parsed), RECORD_FIELDS, '字段序必须与冻结协议逐字一致')
+    // 	runcated 是可选字段：这条没被降级，就不该出现。RECORD_FIELDS 里的位置仍然钉住顺序。
+      assert.deepEqual(Object.keys(parsed), RECORD_FIELDS.filter((field) => field !== 'truncated'), '字段序必须与冻结协议逐字一致')
     assert.equal(parsed.task, started.hash, 'task 必须由宿主写死')
     assert.match(parsed.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/, 'ts 由宿主补')
     assert.equal(parsed.probe, 'buggy-demo.html:42:click')
@@ -209,7 +210,7 @@ test('ingestProbe：单行超 8 KiB 截断并标 truncated；到 16 MiB 只写�
   }
 })
 
-test('摄入路由：CORS 头齐全、OPTIONS 预检 204、非 POST 405、体过大 400', async () => {
+test('摄入路由：CORS 头齐全、OPTIONS 预检 204、GET 自检、非法方法 405、体过大 400', async () => {
   const { service, fake, workspace, started } = await setupTask()
   try {
     registerRoutes(fake.ctx, service)
@@ -219,13 +220,31 @@ test('摄入路由：CORS 头齐全、OPTIONS 预检 204、非 POST 405、体过
     const preflight = fakeHttp({ method: 'OPTIONS', url: `${ROUTE_PREFIX}/probe?h=${started.hash}` })
     route.handler(preflight.req, preflight.res)
     const preflightResult = await preflight.deliver()
+    // 预检可以是 204：它本来就不带体。
     assert.equal(preflightResult.status, 204)
     assert.equal(preflightResult.headers['Access-Control-Allow-Origin'], '*')
     assert.match(preflightResult.headers['Access-Control-Allow-Methods'], /POST/)
 
-    const wrongMethod = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/probe?h=${started.hash}` })
+    // GET = 通道自检：**在让用户复现之前**就能回答"通道活着吗"。
+    const handshake = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/probe?h=${started.hash}` })
+    route.handler(handshake.req, handshake.res)
+    const handshakeResult = await handshake.deliver()
+    assert.equal(handshakeResult.status, 200)
+    assert.equal(handshakeResult.json.ok, true)
+    assert.equal(handshakeResult.json.hash, started.hash)
+    assert.equal(handshakeResult.json.httpRecords, 0, '还没发过记录')
+    assert.equal(handshakeResult.headers['Access-Control-Allow-Origin'], '*')
+    assert.match(handshakeResult.json.hint, /通道是通的/)
+
+    const unknown = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/probe?h=ffffffff` })
+    route.handler(unknown.req, unknown.res)
+    assert.equal((await unknown.deliver()).status, 404)
+
+    const wrongMethod = fakeHttp({ method: 'PUT', url: `${ROUTE_PREFIX}/probe?h=${started.hash}` })
     route.handler(wrongMethod.req, wrongMethod.res)
-    assert.equal((await wrongMethod.deliver()).status, 405)
+    const wrongResult = await wrongMethod.deliver()
+    assert.equal(wrongResult.status, 405)
+    assert.match(wrongResult.json.reason, /GET.*自检/)
 
     const missingHash = fakeHttp({ url: `${ROUTE_PREFIX}/probe`, body: '{"probe":"x"}' })
     route.handler(missingHash.req, missingHash.res)
@@ -239,8 +258,18 @@ test('摄入路由：CORS 头齐全、OPTIONS 预检 204、非 POST 405、体过
     })
     route.handler(ok.req, ok.res)
     const accepted = await ok.deliver()
-    assert.equal(accepted.status, 204)
+    // 200 而不是 204：响应体（accepted/rejected）是投递方唯一的自检依据，
+    // 而 204 按 HTTP 规范不许带体（严格客户端会拒绝读取）。
+    assert.equal(accepted.status, 200)
     assert.equal(accepted.json.accepted, 2)
+
+    // 发过记录之后，自检必须如实反映"通道送进来过东西"。
+    const after = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/probe?h=${started.hash}` })
+    route.handler(after.req, after.res)
+    const afterResult = await after.deliver()
+    assert.equal(afterResult.json.httpRecords, 2)
+    assert.ok(afterResult.json.httpLastAt > 0)
+    assert.equal(afterResult.json.logLines, 2)
 
     const tooBig = fakeHttp({ url: `${ROUTE_PREFIX}/probe?h=${started.hash}`, body: 'x'.repeat(70 * 1024) })
     route.handler(tooBig.req, tooBig.res)
@@ -268,8 +297,10 @@ test('浏览器桩：在 vm 沙箱里真的按同一协议发出一条记录（s
         constructor(parts) { this.parts = parts }
         text() { return this.parts.join('') }
       },
-      setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length },
-      clearTimeout: () => undefined,
+      // 定时器替身要真的记住"被取消了"：桩在加载时会先 schedule 一次、再立刻 flush，
+      // 那次 clearTimeout 如果不生效，测试就会去调用一个早被取消的定时器。
+      setTimeout: (fn, ms) => { const handle = { fn, ms, cancelled: false }; timers.push(handle); return handle },
+      clearTimeout: (handle) => { if (handle) handle.cancelled = true },
       navigator: {
         sendBeacon: options.beaconFails
           ? () => false
@@ -285,14 +316,23 @@ test('浏览器桩：在 vm 沙箱里真的按同一协议发出一条记录（s
   const { sandbox, beacons, timers } = run()
   assert.equal(typeof sandbox.dshProbe, 'function', '经典脚本要挂在全局上（页面不能 import 它）')
 
-  sandbox.dshProbe('buggy-demo.html:42:onclick', { itm: 'undefined', list: 3 }, { level: 'warn', msg: '点了' })
-  assert.equal(timers.length, 1, '批量发送：先排队，不逐条打网络')
-  timers[0].fn()
+  // ★ 加载即报到：脚本一执行就该发出一条 `debug-mode:ready`（并且立刻冲刷）。
+  // 这一条同时证明「桩加载了」与「通道是通的」——没有它，"通道死了"和"埋点没执行"
+  // 的现象一模一样（日志一片空白）。所以它必须是**不需要页面显式调用**的。
+  assert.equal(beacons.length, 1, 'ready 记录必须在加载时立刻发出，不等 200ms 批量')
+  const ready = JSON.parse(beacons[0].payload.trimEnd())
+  assert.equal(ready.probe, 'debug-mode:ready')
+  assert.equal(ready.data.runtime, 'browser')
 
-  assert.equal(beacons.length, 1)
-  assert.equal(beacons[0].url, endpoint)
-  const line = beacons[0].payload.trimEnd()
-  assert.deepEqual(Object.keys(JSON.parse(line)), RECORD_FIELDS, '浏览器桩与协议模块的字段序必须一致')
+  sandbox.dshProbe('buggy-demo.html:42:onclick', { itm: 'undefined', list: 3 }, { level: 'warn', msg: '点了' })
+  const live = timers.filter((handle) => !handle.cancelled)
+  assert.equal(live.length, 1, '批量发送：业务探针先排队，不逐条打网络')
+  live[0].fn()
+
+  assert.equal(beacons.length, 2)
+  assert.equal(beacons[1].url, endpoint)
+  const line = beacons[1].payload.trimEnd()
+  assert.deepEqual(Object.keys(JSON.parse(line)), RECORD_FIELDS.filter((field) => field !== 'truncated'), '浏览器桩与协议模块的字段序必须一致（truncated 只在降级时出现）')
   const record = JSON.parse(line)
   assert.equal(record.task, 'deadbeef')
   assert.equal(record.probe, 'buggy-demo.html:42:onclick')
@@ -302,12 +342,22 @@ test('浏览器桩：在 vm 沙箱里真的按同一协议发出一条记录（s
 
   // sendBeacon 不可用时退回 fetch（仍是 CORS 简单请求：text/plain + no-cors）。
   const fallback = run({ beaconFails: true })
-  fallback.sandbox.dshProbe('a:1:b')
-  fallback.sandbox.dshProbe.flush()
-  assert.equal(fallback.fetches.length, 1)
+  assert.equal(fallback.fetches.length, 1, 'ready 那条在加载时就走 fetch 兜底')
   assert.equal(fallback.fetches[0].init.method, 'POST')
   assert.equal(fallback.fetches[0].init.mode, 'no-cors')
   assert.match(fallback.fetches[0].init.headers['content-type'], /text\/plain/)
+  assert.equal(JSON.parse(String(fallback.fetches[0].init.body).trimEnd()).probe, 'debug-mode:ready')
+
+  // 批量：一次 POST 可以带多条（NDJSON，一行一条）。
+  fallback.sandbox.dshProbe('a:1:b')
+  fallback.sandbox.dshProbe('a:2:c', { n: 2 })
+  fallback.sandbox.dshProbe.flush()
+  assert.equal(fallback.fetches.length, 2)
+  const batched = String(fallback.fetches[1].init.body).trimEnd().split('\n')
+  assert.equal(batched.length, 2, '批量：NDJSON 一行一条')
+  assert.equal(JSON.parse(batched[0]).probe, 'a:1:b')
+  assert.equal(JSON.parse(batched[1]).probe, 'a:2:c')
+  assert.deepEqual(JSON.parse(batched[1]).data, { n: 2 })
 
   // 探针不许把页面搞挂：任何坏负载都安静降级。
   const hostile = run()
@@ -321,7 +371,177 @@ test('浏览器桩：在 vm 沙箱里真的按同一协议发出一条记录（s
   assert.doesNotThrow(() => hostile.sandbox.dshProbe.flush())
 })
 
-test('start 会写出浏览器桩并把端点交给 Agent；端点未知时不写假地址', async () => {
+test('多语言片段：占位符全部替换、锚点缺失即抛错（别让 Agent 照着字面量埋点）', async () => {
+  const guide = await renderHttpGuide({
+    hash: 'deadbeef',
+    endpoint: 'http://127.0.0.1:19387/dsh-debug-mode/probe?h=deadbeef',
+    logPath: '/repo/.dsh/debug-mode/tasks/deadbeef/deadbeef.log',
+    probeStub: '/repo/.dsh/debug-mode/tasks/deadbeef/runtime/probe.mjs',
+  })
+  assert.ok(!guide.includes('{{'), '不得残留占位符')
+  assert.ok(guide.includes('?h=deadbeef'), '端点必须烘死进去')
+  assert.ok(guide.includes('/.dsh/debug-mode/tasks/deadbeef/deadbeef.log'))
+  // 这份文件的全部意义：**语言无关**。所以常见语言都得有现成片段。
+  for (const language of ['curl', 'Python', 'Node.js', 'Ruby', 'Go', 'PHP', 'PowerShell', 'Java']) {
+    assert.ok(guide.includes(language), `片段里缺 ${language}`)
+  }
+  // 而且要写清"宿主替你管掉了什么"——否则 Agent 还是会去手写那些逻辑。
+  assert.match(guide, /你\*\*不需要\*\*做的事/)
+  // ts 的**双向**契约都要写清（v0.17 纠正过：不是"投递方伪造无效"）：
+  // 省略 ⇒ 宿主补到达时刻；提供 ⇒ 采纳（批量投递靠它保住事件时刻）。
+  assert.match(guide, /省略 `ts` 就补到达时刻/)
+  assert.match(guide, /想给\*\*事件时刻\*\*就自己传 `ts`/)
+  // 回执里那三个数字是唯一的自检依据，别丢。
+  assert.match(guide, /response\.read\(\)/, 'Python 片段必须读回执，不能 urlopen(...).close()')
+  assert.match(guide, /accepted/)
+
+  await assert.rejects(
+    () => renderHttpGuide({ template: '# 什么都没有', hash: 'x', endpoint: 'y', logPath: 'z', probeStub: 'w' }),
+    /placeholder missing/,
+  )
+})
+
+test('通道自检（probeStatus）：报出通道收过多少条，并给一句可照做的提示', async () => {
+  const { service, workspace, started } = await setupTask()
+  try {
+    const before = await service.probeStatus(started.hash)
+    assert.equal(before.ok, true)
+    assert.equal(before.httpRecords, 0)
+    assert.equal(before.logLines, 0)
+    assert.match(before.hint, /还没有记录送进来/)
+
+    // 最小调用：**只有 probe 一个字段**——任何语言写一行 JSON 就能埋点，这就是"统一入口"。
+    const minimal = await service.ingestProbe({ hash: started.hash, payload: '{"probe":"app.py:1:x"}' })
+    assert.equal(minimal.accepted, 1)
+
+    const after = await service.probeStatus(started.hash)
+    assert.equal(after.httpRecords, 1)
+    assert.ok(after.httpLastAt > 0)
+    assert.equal(after.logLines, 1)
+    assert.match(after.hint, /已经送进来过 1 条/)
+
+    assert.equal((await service.probeStatus('ffffffff')).code, 404)
+    assert.equal((await service.probeStatus('not-a-hash')).code, 400)
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('report 把通道状态摆出来：日志为空时"通道没通"与"用户还没复现"必须能区分', async () => {
+  const { service, workspace, started } = await setupTask()
+  try {
+    const report = await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第一轮' })
+    assert.equal(report.ok, true)
+    // 宿主**只知道**自己经 HTTP 收到了几条；文件桩是直接写文件的，宿主看不见——
+    // 所以它报"本轮日志 N 行"，不把 N 冒充成"文件桩写入条数"。
+    assert.match(report.text, /探针通道：HTTP 累计收到 0 条 · 本轮日志 0 行/)
+    assert.match(report.text, /本轮日志还是空的/)
+    assert.match(report.text, /还从未被验证过/, '通道没被验证过时必须点名，否则会白等一整轮')
+    assert.match(report.text, /GET/, '要告诉 Agent 怎么自检')
+    assert.match(report.text, /输入框上方的两个按钮/, '面板在输入框上方，文案不能还写着下方')
+
+    // 通过 HTTP 送一条进去之后，通道状态必须反映出来。
+    await service.ingestProbe({ hash: started.hash, payload: { probe: 'app.py:9:y' } })
+    await service.reproduce({ hash: started.hash, sessionId: SESSION })
+    // 先读再 continue：这正是闸门 C 要求的顺序（没读过的字节不许被清掉）。
+    await service.read({ sessionId: SESSION, workspace: workspace.root })
+    const moved = await service.continueDebug({ sessionId: SESSION, workspace: workspace.root, nextPlan: 'x' })
+    assert.equal(moved.ok, true, moved.text)
+    const second = await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第二轮' })
+    // 第二轮：HTTP 计数是**累计值**（1），日志行数是**本轮**的（continue 已清空 ⇒ 0）。
+    // 这两个数字放在一起看着"矛盾"，其实是两件事——所以措辞必须把它们分开说。
+    assert.match(second.text, /探针通道：HTTP 累计收到 1 条 · 本轮日志 0 行/)
+    assert.match(second.text, /通道是通的；空的是\*\*这一轮\*\*/, '通道已被证明过时，提示必须换成另一个方向')
+    assert.ok(!/还从未被验证过/.test(second.text), '通道已经验证过了，不该再念那段自检话')
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('端点来源：DSH_WEB_URL 优先，其次是 webServer.port（权威且总在手里）', async () => {
+  const previous = process.env.DSH_WEB_URL
+  const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  try {
+    // ① 两个都有时，环境变量优先（部署可能把它改成代理/隧道地址）。
+    process.env.DSH_WEB_URL = 'https://debug.example.com'
+    const envFirst = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 19387 }).ctx)
+    assert.equal(envFirst.endpointBase(), 'https://debug.example.com')
+    assert.equal(envFirst.probeEndpoint('deadbeef'), 'https://debug.example.com/dsh-debug-mode/probe?h=deadbeef')
+
+    // ② 没有环境变量 ⇒ 用 webServer.port 拼回环地址。这正是"Agent 知道 origin
+    //    却不知道路径"那件事的正解：地址本来就在插件自己手里。
+    delete process.env.DSH_WEB_URL
+    const ported = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 19387 }).ctx)
+    assert.equal(ported.endpointBase(), 'http://127.0.0.1:19387')
+    assert.equal(ported.probeEndpoint('deadbeef'), 'http://127.0.0.1:19387/dsh-debug-mode/probe?h=deadbeef')
+
+    // ③ 两个都没有 ⇒ null（绝不猜端口），由调用方明说。
+    const bare = new DebugService(createFakeContext({ cwd: workspace.root }).ctx)
+    assert.equal(bare.endpointBase(), null)
+    assert.equal(bare.probeEndpoint('deadbeef'), null)
+
+    // ④ 非法端口同样不猜。
+    const bogus = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 70000 }).ctx)
+    assert.equal(bogus.endpointBase(), null)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_WEB_URL
+    else process.env.DSH_WEB_URL = previous
+    await workspace.cleanup()
+  }
+})
+
+test('宿主摄入路径**不许有任何静默截断**：要么值完整，要么带 truncated 标记', async () => {
+  const { service, workspace, started } = await setupTask()
+  const logAbs = join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash, `${started.hash}.log`)
+  try {
+    // 实测踩过的坑（v0.16）：`ingestProbe` 里曾有两条**没写进任何文档**的预截断——
+    // `probe.slice(0, 200)` 与 `msg.slice(0, 2000)`。于是 10000 字符的 msg 被悄悄砍到
+    // 2000，**8000 字符无声消失且没有任何标记**；而那一行只有 ~2 KB、根本没碰到 8 KiB
+    // 上限，所以从"行是否超限"这个角度看一切正常（这就是它为什么能藏住）。
+    // 更糟的是 Node 桩**没有**这两条预截断，同一条记录走文件桩会正确标 truncated——
+    // 同一个协议在三处实现上给出不同结果。
+    const cases = [
+      { label: '长 msg @10000', payload: { probe: 'p:msg', msg: 'M'.repeat(10000) } },
+      { label: '长 msg @10000 中文', payload: { probe: 'p:msg-zh', msg: '中'.repeat(10000) } },
+      { label: '长 msg @30000', payload: { probe: 'p:msg-3w', msg: 'M'.repeat(30000) } },
+      { label: '长 data', payload: { probe: 'p:data', data: { v: 'x'.repeat(20000) } } },
+    ]
+
+    for (const item of cases) {
+      const receipt = await service.ingestProbe({ hash: started.hash, payload: item.payload })
+      assert.equal(receipt.accepted, 1, `${item.label}: 必须被接受`)
+      const { records, dirtyLines } = parseLog(await readFile(logAbs, 'utf8'))
+      assert.equal(dirtyLines, 0, `${item.label}: 不许有脏行`)
+      const record = records[records.length - 1]
+      // 直接量**落盘那一行**的字节数（不是重新序列化估的）。
+      const lineBytes = byteLength(await lastRawLine(logAbs))
+      assert.ok(lineBytes <= 8 * 1024, `${item.label}: 单行不许超 8 KiB（实测 ${lineBytes}）`)
+
+      const sentMsg = item.payload.msg
+      if (sentMsg !== undefined && record.msg.length < sentMsg.length) {
+        // 值被砍过 ⇒ **必须**有标记，且值里要写清省略了多少。
+        assert.equal(record.truncated, true, `${item.label}: 砍了字符却没有截断标记（静默丢失）`)
+        assert.match(record.msg, /省略 \d+ 字符/, `${item.label}: 值里要说清省略了多少`)
+      }
+    }
+
+    // probe 标识同样不许被静默砍——它是分组计数的键，砍了会让两组悄悄合并成一组。
+    const longProbe = `p:${'z'.repeat(500)}`
+    await service.ingestProbe({ hash: started.hash, payload: { probe: longProbe } })
+    const after = parseLog(await readFile(logAbs, 'utf8'))
+    assert.equal(after.records[after.records.length - 1].probe, longProbe, '长 probe 标识不该被静默砍短')
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+/** 日志最后一行**原文**（不含换行）——用来量真实落盘的字节数。 */
+async function lastRawLine(logAbsolute) {
+  const raw = (await readFile(logAbsolute, 'utf8')).trimEnd()
+  return raw.slice(raw.lastIndexOf('\n') + 1)
+}
+
+test('start 会写出浏览器桩与多语言片段并把端点交给 Agent；端点未知时不写假地址', async () => {
   const { service, workspace, started } = await setupTask()
   const previous = process.env.DSH_WEB_URL
   try {
@@ -336,13 +556,21 @@ test('start 会写出浏览器桩并把端点交给 Agent；端点未知时不�
       assert.ok(!stub.includes('__DSH_ENDPOINT__'))
       assert.ok(stub.includes(`${previous.replace(/\/+$/, '')}${ROUTE_PREFIX}/probe?h=${started.hash}`),
         '端点必须是宿主的绝对地址（页面在 file:// 下，相对路径到不了宿主）')
+      // 多语言片段也必须生成，并且端点/哈希都烘死好了。
+      const snippets = await readFile(join(dir, 'runtime', 'probe.http.md'), 'utf8')
+      assert.ok(!snippets.includes('{{'), '片段不得残留占位符')
+      assert.ok(snippets.includes(`?h=${started.hash}`))
       assert.match(started.text, /HTTP 摄入端点/)
       assert.match(started.text, /浏览器探针桩/)
+      assert.match(started.text, /埋点优先走 HTTP 通道/, 'start 的返回值必须把 HTTP 摆在首选位置')
+      assert.match(started.text, /自检/, '并且提醒先自检再让用户复现')
     } else {
       // 端口未知时**不写一个猜的地址**：猜错的后果是探针静默丢失，
       // 那正是这个插件最不能接受的失败方式——所以宁可不生成，也要明说。
       const stubExists = await readFile(join(dir, 'runtime', 'probe.browser.js'), 'utf8').then(() => true, () => false)
       assert.equal(stubExists, false, '宿主地址未知时不该生成一个端点填错的桩')
+      const snippetsExist = await readFile(join(dir, 'runtime', 'probe.http.md'), 'utf8').then(() => true, () => false)
+      assert.equal(snippetsExist, false, '同理：多语言片段也不该带着假端点生成')
       assert.match(started.text, /宿主地址未知/)
       assert.match(guide, /宿主地址未知/)
     }

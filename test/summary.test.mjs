@@ -19,6 +19,33 @@ function logText(records) {
   return records.map((record) => formatRecord(record).trimEnd()).join('\n')
 }
 
+test('两种"看不见完整值"必须长得不一样：⚠️截断（真的被省略）vs 显示省略（日志里完整）', () => {
+  const big = 'x'.repeat(1000)
+  const text = renderLogSummary({
+    hash: 'deadbeef',
+    round: 1,
+    exists: true,
+    text: [
+      // 这条**真的**被降级过（协议里带 truncated:true）
+      JSON.stringify({ ts: '2026-10-10T10:00:00.000+08:00', task: 'deadbeef', probe: 'a:1', level: 'info', data: { v: big }, truncated: true }),
+      // 这条是完整的，只是显示层会缩短它
+      JSON.stringify({ ts: '2026-10-10T10:00:01.000+08:00', task: 'deadbeef', probe: 'b:2', level: 'info', data: { v: big } }),
+    ].join('\n'),
+  })
+  assert.match(text, /⚠️截断/, '真的被省略的必须点名')
+  assert.match(text, /显示省略/, '只是显示缩短的必须说清"日志里是完整的"')
+  assert.match(text, /日志里是完整的/)
+  // 关键回归守卫：两者不能都只呈现为一个 `…`（那正是害人查一轮的歧义）。
+  // 取**时间序**那一节的行（带时间戳），别被上面的分组行骗到。
+  const timeline = text.split('\n').filter((line) => /^\s+\d{4}-\d{2}-\d{2}T/.test(line))
+  const truncatedLine = timeline.find((line) => line.includes('a:1'))
+  const completeLine = timeline.find((line) => line.includes('b:2'))
+  assert.ok(truncatedLine && completeLine, '两条都该出现在时间序里')
+  assert.match(truncatedLine, /⚠️截断/)
+  assert.ok(!/⚠️截断/.test(completeLine), '没被降级的记录不许被标成截断')
+  assert.match(completeLine, /显示省略/, '完整记录要说明是显示层缩短')
+})
+
 test('日志文件不存在时给排查建议，而不是空表', () => {
   const text = renderLogSummary({ hash: 'deadbeef', round: 1, exists: false })
   assert.match(text, /日志文件不存在/)

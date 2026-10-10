@@ -32,8 +32,18 @@ import { appendFileSync, mkdirSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 /** 单条记录的字段顺序，必须与 lib/protocol.js 的 RECORD_FIELDS 一致。 */
-const FIELDS = ['ts', 'task', 'probe', 'level', 'msg', 'data']
+const FIELDS = ['ts', 'task', 'probe', 'level', 'msg', 'data', 'truncated']
 const MAX_LINE = 8 * 1024
+/**
+ * 超限降级档位：逐步收紧"单个字符串值允许保留多少字符"。
+ *
+ * ⚠️ 与 `lib/protocol.js` 的 `DEGRADE_STEPS` / `DEGRADE_MAX_ITEMS` / `DEGRADE_MAX_DEPTH`
+ * 必须**逐字一致**（`test/protocol.test.mjs` 会喂同一批负载给三处实现并比对字节）。
+ * 为什么不能切序列化好的整行：那会切出半个 JSON，读端只能算脏行（见 protocol.js 的长注释）。
+ */
+const DEGRADE_STEPS = [2048, 512, 128, 16, 0]
+const DEGRADE_MAX_ITEMS = 50
+const DEGRADE_MAX_DEPTH = 6
 /** 单任务日志总字节上限，与 DESIGN.md §11.2 的表格一致。 */
 const MAX_BYTES = 16 * 1024 * 1024
 
@@ -111,6 +121,119 @@ function serialize(record) {
   return `${line}}\n`
 }
 
+/** UTF-8 字节数（与 lib/protocol.js 的 byteLength 逐字一致；中文不能按字符数算）。 */
+function byteLength(text) {
+  const value = String(text)
+  let bytes = 0
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code < 0x80) bytes += 1
+    else if (code < 0x800) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4
+      index += 1
+    } else bytes += 3
+  }
+  return bytes
+}
+
+/** 递归省略超长值（改的是值，不是已经序列化好的行）。 */
+function clipValue(value, limit, depth) {
+  if (typeof value === 'string') {
+    return value.length > limit ? `${value.slice(0, limit)}…<省略 ${value.length - limit} 字符>` : value
+  }
+  if (value === null || typeof value !== 'object') return value
+  if (depth >= DEGRADE_MAX_DEPTH) return '…<层级过深>'
+  if (Array.isArray(value)) {
+    const kept = value.slice(0, DEGRADE_MAX_ITEMS).map((item) => clipValue(item, limit, depth + 1))
+    if (value.length > DEGRADE_MAX_ITEMS) kept.push(`…<省略 ${value.length - DEGRADE_MAX_ITEMS} 项>`)
+    return kept
+  }
+  const out = {}
+  const keys = Object.keys(value)
+  for (const key of keys.slice(0, DEGRADE_MAX_ITEMS)) out[key] = clipValue(value[key], limit, depth + 1)
+  if (keys.length > DEGRADE_MAX_ITEMS) out['…'] = `省略 ${keys.length - DEGRADE_MAX_ITEMS} 个键`
+  return out
+}
+
+/** 按给定 limit 省略超长值后重新序列化 —— 超限降级的**唯一**渲染路径。 */
+function renderClipped(record, limit) {
+  const candidate = { ...record, truncated: true }
+  // probe 也要参与降级（它是分组计数的键，砍它会把两组悄悄合并）；且砍哪都要留痕。
+  candidate.probe = clipValue(String(record.probe), limit, 0)
+  if (record.msg !== undefined) candidate.msg = clipValue(record.msg, limit, 0)
+  if (record.data !== undefined) candidate.data = clipValue(record.data, limit, 0)
+  return serialize(candidate)
+}
+
+/** 一行是否既放得下、又能被读端解析。 */
+function fitsLine(line) {
+  return byteLength(line) <= MAX_LINE && parses(line)
+}
+
+/**
+ * 序列化 + 超限降级：**省略超长值 → 重新序列化 → 实测字节 → parse 往返校验**。
+ * 绝不切已经序列化好的整行（那会切出半个 JSON，读端只能算脏行）。
+ *
+ * 与 `lib/protocol.js` 的 `encodeRecord()` 必须**逐字同构**（含这里的二分上取整规则），
+ * 否则 `test/protocol.test.mjs` 的三处逐字比对会红。
+ */
+function encode(record) {
+  const full = serialize(record)
+  if (byteLength(full) <= MAX_LINE) return full
+
+  // ① 固定档位快速找可行解，并记住失败的那一档作为二分上界。
+  let best = -1
+  let bestLine = ''
+  let upper = MAX_LINE + 1
+  for (const limit of DEGRADE_STEPS) {
+    const line = renderClipped(record, limit)
+    if (fitsLine(line)) {
+      best = limit
+      bestLine = line
+      break
+    }
+    upper = limit
+  }
+  if (best < 0) {
+    return serialize({
+      ts: record.ts,
+      task: record.task,
+      // 不能裸切：砍了却不说，读端就看不出这条被省略过什么（v0.17 实测踩过）。
+      probe: clipValue(String(record.probe), 200, 0),
+      level: record.level || 'info',
+      truncated: true,
+      msg: `记录超过单行上限（${byteLength(full)} 字节），已降级为骨架`,
+    })
+  }
+
+  // ② 把预算用足：二分找**最大的**能放下的 limit（固定档位只用掉约四分之一预算）。
+  let low = best
+  let high = upper
+  let line = bestLine
+  while (high - low > 1) {
+    const mid = (low + high) >> 1
+    const candidate = renderClipped(record, mid)
+    if (fitsLine(candidate)) {
+      low = mid
+      line = candidate
+    } else {
+      high = mid
+    }
+  }
+  return line
+}
+
+/** 一行是否既是合法 JSON、又满足 probe 必填（写盘前的最后一道闸）。 */
+function parses(line) {
+  try {
+    const parsed = JSON.parse(line)
+    return Boolean(parsed) && typeof parsed === 'object' && typeof parsed.probe === 'string' && parsed.probe !== ''
+  } catch {
+    return false
+  }
+}
+
 /**
  * 写一条探针记录。
  * @param {string} probe  探针标识，推荐 `<相对文件路径>:<行号>:<短标签>`
@@ -144,11 +267,7 @@ export function probe(probe, data, options = {}) {
     }
     if (options.msg) record.msg = String(options.msg)
     if (data !== undefined) record.data = safe(data)
-    let line = serialize(record)
-    if (line.length > MAX_LINE) {
-      line = `${line.slice(0, MAX_LINE - 32)}…","truncated":true}\n`
-    }
-    appendFileSync(LOG, line)
+    appendFileSync(LOG, encode(record))
     currentBytes()
     writes += 1
   } catch {
@@ -187,5 +306,15 @@ probe.stats = () => {
   try { bytes = statSync(LOG).size } catch { bytes = 0 }
   return { task: TASK, log: LOG, bytes, writes }
 }
+
+// ── 加载即报到 ────────────────────────────────────────────────────────────────
+// 为什么要有这一条：日志为空时，"桩根本没被加载 / import 路径不对"与"桩加载了、但那段
+// 代码没走到"的现象**完全一样**（都是一片空白），而这两种情况下 Agent 该做的事截然相反。
+// 一条 ready 记录把它变成事实：看得到它 ⇒ 桩是通的，去查调用点；看不到它 ⇒ 去查 import。
+// 写在模块加载期是有意的——那正是要被证明的那个时刻（"这段代码跑起来了吗"）。
+probe('debug-mode:ready', {
+  runtime: 'node',
+  pid: typeof process === 'object' && process ? process.pid : null,
+}, { msg: '探针桩已加载（这条由桩自己写入，用来区分"桩没加载"与"埋点没执行"）' })
 
 export default probe

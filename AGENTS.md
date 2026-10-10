@@ -17,8 +17,9 @@
 ```
 用户：现象描述
   └─ Agent 分析代码 → 埋探针（带可摘除标记）  ← 不运行任何命令（§1.1 第 14 条）
-       └─ 探针按固定协议写 <repo>/.dsh/debug-mode/tasks/<hash>/<hash>.log
-            （Node 桩直接写文件；浏览器/远端进程 POST 给宿主，见 DESIGN.md §7.6）
+       └─ 探针把记录交给宿主，落进 <repo>/.dsh/debug-mode/tasks/<hash>/<hash>.log
+            （**首选**：POST 宿主的 HTTP 入口——语言无关，写日志只有宿主一份实现；
+              只在热路径 / 需要"崩溃前落盘" / 没有网络栈时才用文件桩，见 DESIGN.md §7.6）
             └─ Agent 通过「读取日志信号」拿到摘要（不自己去翻文件）
                  └─ 用户复现 → 弹出面板：
                       [ 问题已解决 ] → 删日志 + 删掉本次任务的全部探针代码
@@ -50,7 +51,7 @@
 6. **Agent 不直接读日志文件。** 日志内容一律经 `dsh_debug_read` 输出；
    摘要优先、异常全量、省略量显式声明。
 7. **调试准则只在调试模式下注入。** `systemPrompt.section` 的 `text` 必须是 thunk，
-   无活跃任务且无票据时返回空串；否则没进调试模式的会话也会收到「去埋点」的指令，
+   无活跃任务时返回空串；否则没进调试模式的会话也会收到「去埋点」的指令，
    等于把入口约束从提示词层面又打开一次（DESIGN.md §3.9）。
 8. **协议冻结。** 日志行格式与字段序见 DESIGN.md §7.2；只能新增可选字段，
    且必须同步 `lib/protocol.js`、`assets/probe.template.mjs` 与测试。
@@ -85,39 +86,41 @@
 
 ## 2. 当前状态
 
-**M0 – M6 + §16 的 R1–R6 + HTTP 探针通道全部落地，面板已重做为「输入框上方的可折叠卡片」：
-82 个测试全绿。** 剩下的一件事是**人在真实 GUI 里点一次面板**（M4 的验收判据）——
+**M0 – M6 + §16 的 R1–R6 + HTTP 统一埋点入口全部落地，面板已重做为「输入框上方的可折叠卡片」，`/debug` 会直接开一轮、注入段自带本任务地址：
+95 个测试全绿。** 剩下的一件事是**人在真实 GUI 里点一次面板**（M4 的验收判据）——
 代码路径已被产物测试覆盖，但那一步只能由人做。
 
 已落地：
 
 | 文件 | 内容 |
 | --- | --- |
-| [DESIGN.md](./DESIGN.md) | 设计冻结稿（v0.11）：入口/信号协议、代码改动纪律、日志协议、**HTTP 探针通道（§7.6）**、状态机、**面板座位与折叠（§9.1.3/§9.1.3.1）、面板内容（§9.2）**、**防堆屎山机制（§16）**、路线图、待验证清单 |
+| [DESIGN.md](./DESIGN.md) | 设计冻结稿（v0.18）：入口/信号协议、代码改动纪律、日志协议、**HTTP 统一埋点入口（§7.6）**、状态机、**面板座位与折叠（§9.1.3/§9.1.3.1）、面板内容（§9.2）**、**防堆屎山机制（§16）**、路线图、待验证清单 |
 | [package.json](./package.json) | 包清单：`dsh.bundle.patch` + `dsh.client` 双挂载声明 |
 | [cordis.patch.yml](./cordis.patch.yml) | bundle 挂载声明（插入 `debug-mode` 行） |
 | [lib/protocol.js](./lib/protocol.js) | 日志行协议的唯一真相：`formatRecord` / `parseRecord` / `parseLog` |
 | [lib/task.js](./lib/task.js) | 任务哈希、路径约定、状态机与迁移白名单 |
-| [lib/probe-template.js](./lib/probe-template.js) | 由模板生成两种探针桩（锚点校验，缺锚点即抛错） |
-| [lib/debug-service.js](./lib/debug-service.js) | **DebugService**：票据闸门、任务表、日志管道、**HTTP 摄入**、唤醒通道、收尾对账、闸门降级、欠账看板 |
+| [lib/probe-template.js](./lib/probe-template.js) | 由模板生成三种产物（Node 桩 / 浏览器桩 / 多语言 HTTP 片段），锚点校验，缺锚点即抛错 |
+| [lib/debug-service.js](./lib/debug-service.js) | **DebugService**：票据闸门、任务表、日志管道、**HTTP 摄入与通道自检、端点来源**、唤醒通道、收尾对账、闸门降级、欠账看板 |
 | [lib/scan.js](./lib/scan.js) | **防堆屎山的两台机器**：R1 工作区索引 + 窗口 diff、R2/R3 残留扫描与栈式配对、语法自检 |
 | [lib/summary.js](./lib/summary.js) | `dsh_debug_read` 的摘要渲染（异常全量、计数先行、省略显式） |
 | [lib/prompt.js](./lib/prompt.js) | 埋点指南渲染 + 调试准则正文（含"不运行任何命令"）+ `/debug` 指令正文 |
-| [lib/command.js](./lib/command.js) | `/debug` 命令（签票 + 投递插件写死的指令） |
+| [lib/command.js](./lib/command.js) | `/debug` 命令（签票 + **开一轮对话**把指令交给 Agent + 一句给人看的结果说明） |
 | [lib/tools.js](./lib/tools.js) | 5 个 `dsh_debug_*` 工具定义与 agent 作用域注册 |
 | [lib/routes.js](./lib/routes.js) | 面板的 `state` / `board` / `probe` / `resolve` / `reproduce` 同源路由 |
 | [lib/index.js](./lib/index.js) | 宿主半入口：装配命令、工具、提示词段落、路由与会话观察 |
 | [assets/probe.template.mjs](./assets/probe.template.mjs) | 零依赖 Node 探针桩模板（烘死 TASK/LOG；16 MiB 上限） |
 | [assets/probe.browser.js](./assets/probe.browser.js) | 零依赖**浏览器**探针桩模板（经典脚本，`dshProbe` → HTTP 摄入；批量 + 卸载冲刷） |
-| [assets/AGENT-PROBE-GUIDE.md](./assets/AGENT-PROBE-GUIDE.md) | 回给 Agent 的埋点指南模板（含 `{{HASH}}` 等变量；§零「不要运行任何命令」、§五 HTTP 通道） |
+| [assets/AGENT-PROBE-GUIDE.md](./assets/AGENT-PROBE-GUIDE.md) | 回给 Agent 的埋点指南模板（含 `{{HASH}}` 等变量；§零「不要运行任何命令」、§五 HTTP 统一入口、§六 文件桩是最后手段） |
 | [src/client.js](./src/client.js) | 浏览器半**源码**：输入框上方的可折叠卡片 + 三态渲染 + 按钮接线 + 草稿协调 + 样式令牌 |
 | [scripts/build-client.mjs](./scripts/build-client.mjs) | 把源码包成 `__ModuleLoader__` 产物（零第三方依赖） |
+| [scripts/probe-selfcheck.mjs](./scripts/probe-selfcheck.mjs) | **探针边界自检**：边界矩阵 + 协议不变量 + 三处实现一致性；本地/活两种模式；退出码可进 CI |
 | [lib/client.js](./lib/client.js) | 【生成物】客户端产物，勿手改 |
-| `test/*.test.mjs` + [test/helpers.mjs](./test/helpers.mjs) | 82 个守卫测试，全绿（协议/扫描/摘要/服务端到端/工具契约/装配/**HTTP 摄入**/客户端产物与面板） |
+| `test/*.test.mjs` + [test/helpers.mjs](./test/helpers.mjs) | 95 个守卫测试，全绿（协议/扫描/摘要/服务端到端/工具契约/装配/**HTTP 入口与端点来源**/客户端产物与面板） |
 
 **仍未落地（明确记录，不假装完成）**：`ctx.remote.$on` 推送（第一版一律轮询，这是取舍
-不是未知）、面板的真浏览器人工验收、其它语言的探针桩（由 Agent 按协议自写，或直接用
-§7.6 的 HTTP 端点）。
+不是未知）、面板的真浏览器人工验收。注意"其它语言的探针桩"**不再是缺口**：任何能发 HTTP 的
+运行时都直接用 §7.6 的端点，宿主生成的多语言片段（`runtime/probe.http.md`）里端点与哈希
+已经烘死。
 
 ---
 
@@ -141,17 +144,19 @@ debug-mode/
 │   ├── debug-service.js       ← DebugService：票据 + 任务表 + 日志管道 + 唤醒 + 收尾对账 + 闸门降级 + 欠账看板
 │   ├── scan.js                ← 防堆屎山：R1 工作区索引 + 窗口 diff、R2/R3 残留扫描与栈式配对、语法自检
 │   ├── summary.js             ← dsh_debug_read 的摘要渲染
-│   ├── command.js             ← `/debug` 命令（签票 + 投递指令文本）
+│   ├── command.js             ← `/debug` 命令（签票 + 开一轮对话投递指令 + 结果说明）
 │   ├── tools.js               ← 5 个 dsh_debug_* 工具的定义与 agent 作用域注册
 │   ├── routes.js              ← 面板的 state/board/probe/resolve/reproduce 路由
 │   └── prompt.js              ← 指南渲染 + systemPrompt section 正文（仅调试模式下非空）
 ├── src/
 │   └── client.js              ← 浏览器半**源码**（ESM，只能 import 平台种子表）
 ├── scripts/
-│   └── build-client.mjs       ← 把 src/client.js 包成 __ModuleLoader__ 产物
+│   ├── build-client.mjs       ← 把 src/client.js 包成 __ModuleLoader__ 产物
+│   └── probe-selfcheck.mjs    ← 探针边界自检（矩阵 + 不变量 + 三处一致性）
 ├── assets/
 │   ├── probe.template.mjs     ← Node 探针桩模板（生成到任务目录；16 MiB 上限）
 │   ├── probe.browser.js       ← 浏览器探针桩模板（经典脚本；POST 给宿主，见 §7.6）
+│   ├── probe.http.md          ← 多语言 HTTP 片段模板（端点/哈希烘死；写日志只有宿主一份实现）
 │   └── AGENT-PROBE-GUIDE.md   ← 埋点指南模板
 └── test/                      ← node --test，零外部依赖
     ├── helpers.mjs            ← 宿主替身（fake ctx / 临时工作区 / 块构造器）
@@ -160,7 +165,7 @@ debug-mode/
     ├── summary.test.mjs       ← §8 的四条输出契约
     ├── service.test.mjs       ← S1→S7 端到端 + 核心不变量
     ├── tools.test.mjs         ← 工具 schema 子集与返回值合规
-    ├── ingest.test.mjs        ← HTTP 探针通道：协议一致、不可伪造、限额、CORS、浏览器桩
+    ├── ingest.test.mjs        ← HTTP 统一入口：协议一致、不可伪造、限额、CORS、GET 自检、浏览器桩、多语言片段
     ├── wiring.test.mjs        ← 命令 / 路由 / 提示词段落 / apply 装配
     └── client-bundle.test.mjs ← 产物结构 + 迷你 hooks 渲染器
 ```
@@ -185,6 +190,7 @@ debug-mode/
 ```bash
 node scripts/build-client.mjs      # 生成 lib/client.js（改了 src/client.js 必须重跑）
 node --test test/*.test.mjs        # 跑全部单测（会先自动重新构建客户端产物）
+node scripts/probe-selfcheck.mjs   # 探针边界自检（退出码可进 CI；加 --endpoint 打活的 DSH）
 ```
 
 > 注意：**不要**写 `node --test test/`。Node 24 会把目录参数当成模块名解析而报
@@ -247,7 +253,7 @@ DSH 有两条互不相通的客户端通道，API 名一样、能力完全不同
 > 下面这段话是插件要注入给**被调试会话**的准则，本仓库自己也遵守它。
 > 它已经实现为 `lib/prompt.js` 的 `debugGuidance()`，由 `lib/index.js` 在
 > **agent 作用域**注册的 `systemPrompt.section` 注入，**只在任务活跃时**返回非空正文
-> （thunk：无任务返回空串）。改这里的措辞，就要同步改 `lib/prompt.js`，反之亦然。
+> （thunk：**无活跃任务就返回空串**）。改这里的措辞，就要同步改 `lib/prompt.js`，反之亦然。
 
 - 进入调试模式 = 调用 `dsh_debug_start`，把用户的现象描述原样记进 `goal`。
 - **一眼能看出根因就别进调试模式**：说明根因、直接改代码。用户敲了 `/debug` 不等于
@@ -293,8 +299,14 @@ DSH 有两条互不相通的客户端通道，API 名一样、能力完全不同
 - `output.render(args, value)` 必填；**`execute` 的返回值还会被对着 `output.schema`
   校验**，不符合就整次调用变成 `ToolOutputError`。所以错误路径的返回值也必须合规。
 - `ctx.commands.register({ name, description, input?, handler })`；`handler` 返回
-  `{kind:'success', text}` —— **这段 text 就是投给 Agent 的指令正文**，
-  所以 `/debug` 的指令内容是插件写的，不是用户或模型写的（闸门确定性的来源）。
+  `{kind:'success', text}` —— ⚠️ **这段 text 是给人看的，不会送到模型那里。**
+  已核实 `@deepseek-ai/dsh-commands` 的 `execute()`，注释原文是
+  "Parse and execute a known command **without sending it to the model**"，
+  返回值只落进 `command/run` / `command/done` 两个 log-only 事件（同一段注释：
+  "no turn wraps them"）。所以「敲了命令之后 Agent 就开始干活」这件事必须靠
+  **显式开一轮**（`ctx.sessionController.prompt({ mode:'queue', … })`），
+  不能靠返回值——v0.13 之前这里写反了，导致 `/debug <描述>` 签完票之后模型什么都没收到，
+  用户还得自己补一句「开始」（DESIGN.md §3.5.1）。
   命令的 `CommandDescriptor` 会被 `@Remote list(agent)` 列给 UI，所以 `/debug`
   会自动出现在宿主的命令面板里。
 - 工具要在 **agent 作用域**注册（`'agent/created'`，serial 事件）。**注意**：用事件
@@ -305,6 +317,61 @@ DSH 有两条互不相通的客户端通道，API 名一样、能力完全不同
 - 浏览器↔宿主走 **`ctx.webServer.register({kind,path,handler})` 同源路由 + 浏览器
   `fetch` + 轮询**；**`host.call(...)` 在包通道里并不存在**（那是动态通道的 API）。
   路由 handler 的 `res` 是 **Node 的 `ServerResponse`**（`statusCode` / `setHeader` / `end`）。
+- **端点地址插件自己有，不要问用户**（v0.14 核实）：`dsh-web-app` 的 `localWebUrl()`
+  就是 `` `http://127.0.0.1:${ctx.webServer.port}` ``——`DSH_WEB_URL` 本身就是从
+  `webServer.port` 算出来的，**而且宿主已经把同一个地址注进了模型自己的系统提示**
+  （`app:web-surface` 段）。所以 `endpointBase()` 是「`DSH_WEB_URL` 优先，其次
+  `webServer.port`」。推论有两条，都很容易踩：
+  ① **只把拼好的 URL 给 Agent 是不够的**——它知道 origin、也知道哈希，但 URL 会随
+     上下文压缩而丢，于是它只能反问「这里的 `<路径>` 是什么」。所以
+     `/dsh-debug-mode/probe?h=<hash>` 这个**路径形状**必须当成常量写进注入段
+     （哈希走查询串，不是路径段）；
+  ② 注入段是唯一每次模型调用都在的文本，所以本任务的**全部地址**（端点、桩、日志、
+     指南）都必须在那儿，不能只留一句"优先走 HTTP 端点"。
+- **单行超限只能"省略值再重新序列化"，绝不能切已经序列化好的整行**（v0.15，实测写出脏行）：
+  老实现 `line.slice(0, 8*1024-32) + '…","truncated":true}'` 只在切点落在**顶层字符串字段**
+  里时才恰好闭合成功（所以顶层 `msg` 10000 字符反而能解析），切在 `data` 里必然留下没闭合的
+  `[`/`{` ⇒ 读端算脏行。三处实现（`lib/protocol.js` / Node 桩 / 浏览器桩）必须**逐字同构**，
+  `test/protocol.test.mjs` 会把同一批负载喂给三处并比对字节。长度一律按 **UTF-8 字节**算
+  （`byteLength()`：中文 3、代理对 4），不是字符数。
+- **摘除探针块会留下"块外空行"**（v0.15 发现现象；纪律见下面 v0.18 那条）：Agent 习惯在块
+  前后各留一个空行做视觉分隔，那些空行在标记**外面**，只按标记删行就会把它们留在用户文件里。
+  `removeBlocks()` 因此会在每处摘除缝上收敛纯空白行（至多留 1 行，文件首行折叠成 0）并回报
+  `collapsedBlankLines`。宿主**无法**区分"原本 0 个空行"与"原本 1 个"，所以"与插入前逐字
+  相同"要靠插入纪律——但那句纪律的**正确**说法在下面那条（v0.15 这里曾写成"要分隔就把空行
+  放进块内"，是**错的**：那样会把原有的空行一起吃掉）。
+- **`ingestProbe` 里不许有静默预截断**（v0.16，实测藏了一整轮）：曾有 `probe.slice(0, 200)`
+  与 `String(raw.msg).slice(0, 2000)`，于是 10000 字符的 `msg` 被悄悄砍到 2000——**8000 字符
+  无声消失、没有任何标记**，而那一行只有 ~2 KB、**根本没碰到 8 KiB 上限**（这就是它能藏住的
+  原因：从"行是否超限"的角度看一切正常）。且 Node 桩没有这两条，同一记录走文件桩会正确标
+  `truncated` ⇒ 三处实现结果不同。**截断权威只有 `encodeRecord()` 一处**。
+  回归守卫：`test/ingest.test.mjs` 的"宿主摄入路径不许有任何静默截断"。
+- **空行的命运只看它落在标记的哪一侧**（v0.18 纠正 v0.15 的说法，那一版写错过一行）：
+  标记**外** ⇒ 宿主不碰它（活下来）；标记**内** ⇒ 跟块一起消失。所以有**两种**错误方向，
+  而清理逻辑只兜得住一种：
+  ① **把原有的空行包进标记里** ⇒ 被连带删除（吃掉用户的空行）。**兜不住**——
+     它落在删除区间里，连 `collapsedBlankLines` 都不会记（那不叫收敛）。
+     指南示例一度正好踩在这里（把块插在原空行的位置上），照抄就会吃一个空行；
+  ② 在标记**外**加填充 ⇒ 留下 1 个空行（缝上收敛把 2 个降到 1 个，降不到 0）。
+  纪律（写进指南 §7.2 与注入准则）：**原有的空行留在标记外，只有自加的空行才放进标记内**；
+  机械做法 = "把 `start` 插在原有空行的**后面**"。
+- **校验空白要看位置，不能看行数**（v0.18）：实测出现过「一处少 1 行 + 一处多 1 行 ⇒
+  总行数与基线相同」，只看总数会判成"全对"，实际是一个空行从 A 处搬到了 B 处。
+  `scripts/probe-selfcheck.mjs` 的**空白演练**（第四节）按位置打 before/after，
+  并专门留了"行数相同、位置不同"的用例。
+- **`ts` 参与 8 KiB 预算**（v0.18，测试自身踩过）：让宿主侧用 7 字符的 `'FIXED'`、
+  桩侧用 29 字符的 ISO 时间，两者会二分出**不同的** clip 长度而"三处不一致"——
+  事后归一化 `ts` 补不回来，因为预算已经按不同的输入算过了。比对三处实现时必须给**等长** `ts`。
+- **自检脚本的矩阵要跟着 HTTP 契约走**（v0.17）：本地模式直接调 `ingestProbe`、活模式走
+  HTTP 路由（**请求体 ≤ 64 KiB**），矩阵里一旦有用例超过 64 KiB，活模式 400、本地通过
+  ——同一个矩阵两个结论（实测踩过：9000 个小键）。脚本启动时会自检矩阵并明确指出
+  "修 MATRIX，不是修被测代码"。`scripts/probe-selfcheck.mjs` 还有一条纪律：
+  **第一条不变量曾经写错过**——它断言"投递方伪造 ts 无效"，而真相是宿主**原样采纳**
+  投递方给的 `ts`（批量投递必须靠它保住事件时刻）。**写不变量前先读实现**，
+  别把"我以为的契约"烧进检查器。
+- **`…` 不许同时表示两件事**：`⚠️截断`（记录带 `truncated:true`，不可恢复）与
+  `…（显示省略 N 字符）`（只是显示层缩写，日志里完整）。老的单一 `…` 让一次真实排查整轮
+  都在猜是哪个——`summary.js` 的显示阈值是 **240 字符**，与 8 KiB 上限无关。
 - 唤醒 Agent 用 `ctx.sessionController.prompt(request, signal)`；
   `content` 用 `[{type:'text', text}]` 即可，`requestId` 只当幂等键用（运行时是字符串）。
 - `systemPrompt.section({name, order, text})` 的 `text` 可以是 thunk；order 取自

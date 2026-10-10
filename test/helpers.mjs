@@ -77,6 +77,10 @@ export function createFakeContext(options = {}) {
       },
     },
     webServer: {
+      // 真实宿主的 webServer 服务有个公开的 `port`（`dsh-host-webserver` 的
+      // `get port()`）。默认**不给**，这样"两个来源都拿不到"的降级分支才测得到；
+      // 要测端口来源的用 `options.webPort`。
+      ...(options.webPort ? { port: options.webPort } : {}),
       register(route) {
         routes.push(route)
         return () => undefined

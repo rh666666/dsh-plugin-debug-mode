@@ -37,8 +37,13 @@
   // ─────────────────────────────────────────────────────────────────────────────
 
   /** 单条记录的字段顺序，必须与 lib/protocol.js 的 RECORD_FIELDS 一致。 */
-  var FIELDS = ['ts', 'task', 'probe', 'level', 'msg', 'data']
+  var FIELDS = ['ts', 'task', 'probe', 'level', 'msg', 'data', 'truncated']
   var MAX_LINE = 8 * 1024
+  // 超限降级档位：与 lib/protocol.js 的 DEGRADE_STEPS 必须逐字一致。
+  // 绝不能切已经序列化好的整行——那是半个 JSON，读端只能算脏行。
+  var DEGRADE_STEPS = [2048, 512, 128, 16, 0]
+  var DEGRADE_MAX_ITEMS = 50
+  var DEGRADE_MAX_DEPTH = 6
   var FLUSH_MS = 200
   var MAX_BATCH = 32
   var LEVELS = { trace: 1, debug: 1, info: 1, warn: 1, error: 1 }
@@ -110,6 +115,131 @@
     return line + '}\n'
   }
 
+  /** UTF-8 字节数（与 lib/protocol.js 的 byteLength 逐字一致；中文不能按字符数算）。 */
+  function byteLength(text) {
+    var value = String(text)
+    var bytes = 0
+    for (var index = 0; index < value.length; index += 1) {
+      var code = value.charCodeAt(index)
+      if (code < 0x80) bytes += 1
+      else if (code < 0x800) bytes += 2
+      else if (code >= 0xd800 && code <= 0xdbff) {
+        bytes += 4
+        index += 1
+      } else bytes += 3
+    }
+    return bytes
+  }
+
+  /** 递归省略超长值（改的是值，不是已经序列化好的行）。 */
+  function clipValue(value, limit, depth) {
+    if (typeof value === 'string') {
+      return value.length > limit ? value.slice(0, limit) + '\u2026<\u7701\u7565 ' + (value.length - limit) + ' \u5b57\u7b26>' : value
+    }
+    if (value === null || typeof value !== 'object') return value
+    if (depth >= DEGRADE_MAX_DEPTH) return '\u2026<\u5c42\u7ea7\u8fc7\u6df1>'
+    var kept
+    var index
+    if (Object.prototype.toString.call(value) === '[object Array]') {
+      kept = []
+      for (index = 0; index < value.length && index < DEGRADE_MAX_ITEMS; index += 1) {
+        kept.push(clipValue(value[index], limit, depth + 1))
+      }
+      if (value.length > DEGRADE_MAX_ITEMS) kept.push('\u2026<\u7701\u7565 ' + (value.length - DEGRADE_MAX_ITEMS) + ' \u9879>')
+      return kept
+    }
+    var out = {}
+    var keys = Object.keys(value)
+    for (index = 0; index < keys.length && index < DEGRADE_MAX_ITEMS; index += 1) {
+      out[keys[index]] = clipValue(value[keys[index]], limit, depth + 1)
+    }
+    if (keys.length > DEGRADE_MAX_ITEMS) out['\u2026'] = '\u7701\u7565 ' + (keys.length - DEGRADE_MAX_ITEMS) + ' \u4e2a\u952e'
+    return out
+  }
+
+  /** 一行是否既是合法 JSON、又满足 probe 必填（入队前的最后一道闸）。 */
+  function parses(line) {
+    try {
+      var parsed = JSON.parse(line)
+      return Boolean(parsed) && typeof parsed === 'object' && typeof parsed.probe === 'string' && parsed.probe !== ''
+    } catch (error) {
+      return false
+    }
+  }
+
+  /** 按给定 limit 省略超长值后重新序列化 —— 超限降级的**唯一**渲染路径。 */
+  function renderClipped(record, limit) {
+    var candidate = {}
+    for (var key in record) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) candidate[key] = record[key]
+    }
+    candidate.truncated = true
+    // probe 也要参与降级（它是分组计数的键，砍它会把两组悄悄合并）；且砍哪都要留痕。
+    candidate.probe = clipValue(String(record.probe), limit, 0)
+    if (record.msg !== undefined) candidate.msg = clipValue(record.msg, limit, 0)
+    if (record.data !== undefined) candidate.data = clipValue(record.data, limit, 0)
+    return serialize(candidate)
+  }
+
+  /** 一行是否既放得下、又能被读端解析。 */
+  function fitsLine(line) {
+    return byteLength(line) <= MAX_LINE && parses(line)
+  }
+
+  /**
+   * 序列化 + 超限降级：省略超长值 → 重新序列化 → 实测字节 → parse 往返校验。
+   * 绝不切已经序列化好的整行。
+   *
+   * 与 `lib/protocol.js` 的 `encodeRecord()` 必须**逐字同构**（含二分规则），
+   * 否则 `test/protocol.test.mjs` 的三处逐字比对会红。
+   */
+  function encode(record) {
+    var full = serialize(record)
+    if (byteLength(full) <= MAX_LINE) return full
+
+    // ① 固定档位快速找可行解，并记住失败的那一档作为二分上界。
+    var best = -1
+    var bestLine = ''
+    var upper = MAX_LINE + 1
+    for (var step = 0; step < DEGRADE_STEPS.length; step += 1) {
+      var limit = DEGRADE_STEPS[step]
+      var line = renderClipped(record, limit)
+      if (fitsLine(line)) {
+        best = limit
+        bestLine = line
+        break
+      }
+      upper = limit
+    }
+    if (best < 0) {
+      return serialize({
+        ts: record.ts,
+        task: record.task,
+        // 不能裸切：砍了却不说，读端就看不出这条被省略过什么（v0.17 实测踩过）。
+        probe: clipValue(String(record.probe), 200, 0),
+        level: record.level || 'info',
+        truncated: true,
+        msg: '\u8bb0\u5f55\u8d85\u8fc7\u5355\u884c\u4e0a\u9650\uff08' + byteLength(full) + ' \u5b57\u8282\uff09\uff0c\u5df2\u964d\u7ea7\u4e3a\u9aa8\u67b6',
+      })
+    }
+
+    // ② 把预算用足：二分找**最大的**能放下的 limit（固定档位只用掉约四分之一预算）。
+    var low = best
+    var high = upper
+    var result = bestLine
+    while (high - low > 1) {
+      var mid = (low + high) >> 1
+      var candidate = renderClipped(record, mid)
+      if (fitsLine(candidate)) {
+        low = mid
+        result = candidate
+      } else {
+        high = mid
+      }
+    }
+    return result
+  }
+
   /** 把队列发出去。失败就丢弃这一批——探针不许拖慢页面，也不许无限堆积。 */
   function flush() {
     if (timer !== null) {
@@ -172,9 +302,7 @@
       var record = { ts: stamp(), task: TASK, probe: String(probe), level: level }
       if (opts.msg) record.msg = String(opts.msg)
       if (data !== undefined) record.data = safe(data)
-      var line = serialize(record)
-      if (line.length > MAX_LINE) line = line.slice(0, MAX_LINE - 32) + '\u2026","truncated":true}\n'
-      queue.push(line)
+      queue.push(encode(record))
       writes += 1
       schedule()
     } catch (error) {
@@ -210,6 +338,14 @@
         }, false)
       }
     }
+    // ── 加载即报到 ──────────────────────────────────────────────────────────────
+    // 这一条同时证明两件事：**桩被加载了** + **HTTP 通道是通的**。缺了它，
+    // "通道是死的"和"埋点没执行到"的现象一模一样（日志一片空白）。
+    probe('debug-mode:ready', {
+      runtime: 'browser',
+      ua: global.navigator ? global.navigator.userAgent : null,
+    }, { msg: '浏览器探针桩已加载（这条能到宿主，就说明通道通了）' })
+    flush()
   } catch (error) {
     // 安静降级
   }

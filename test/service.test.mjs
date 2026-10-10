@@ -236,7 +236,10 @@ test('S6 不清空日志：用户点「复现」之后，现场必须原样留�
     assert.ok(instruction)
     const read = await service.read({ sessionId: SESSION, workspace: workspace.root })
     assert.match(read.text, /第一轮现场/, 'Agent 现在读得到用户刚刚复现出来的东西')
-    assert.equal(read.lines, 1)
+    // 2 行 = 桩加载时的 `debug-mode:ready` + 那一条业务探针。ready 在这里很关键：
+    // 它证明"桩是通的"，于是"没看到我要的探针"就只能解释为"那段代码没走到"。
+    assert.equal(read.lines, 2)
+    assert.match(read.text, /debug-mode:ready/)
   } finally {
     await workspace.cleanup()
   }
@@ -314,9 +317,11 @@ test('S3：continue 清空日志但保留哈希；S4：read 真的读到探针�
 
     const read = await service.read({ sessionId: SESSION, workspace: workspace.root })
     assert.equal(read.ok, true)
-    assert.equal(read.lines, 2)
+    // 3 行 = 桩加载时的 ready + 两条业务探针。
+    assert.equal(read.lines, 3)
     assert.match(read.text, /1  src\/app\.js:1:items/, '分组计数必须能读到真日志')
     assert.match(read.text, /走了左分支/)
+    assert.match(read.text, /1  debug-mode:ready/, 'ready 必须在分组里看得见——它区分"桩没加载"与"埋点没执行"')
 
     await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第一轮' })
     // S3 的前置是 `active` 或 `awaiting-agent`：交卷之后球在用户脚下，
