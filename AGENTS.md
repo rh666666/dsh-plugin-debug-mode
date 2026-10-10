@@ -87,7 +87,7 @@
 ## 2. 当前状态
 
 **M0 – M6 + §16 的 R1–R6 + HTTP 统一埋点入口全部落地，面板已重做为「输入框上方的可折叠卡片」，`/debug` 会直接开一轮、注入段自带本任务地址：
-95 个测试全绿。** 剩下的一件事是**人在真实 GUI 里点一次面板**（M4 的验收判据）——
+100 个测试全绿。** 剩下的一件事是**人在真实 GUI 里点一次面板**（M4 的验收判据）——
 代码路径已被产物测试覆盖，但那一步只能由人做。
 
 已落地：
@@ -115,7 +115,7 @@
 | [scripts/build-client.mjs](./scripts/build-client.mjs) | 把源码包成 `__ModuleLoader__` 产物（零第三方依赖） |
 | [scripts/probe-selfcheck.mjs](./scripts/probe-selfcheck.mjs) | **探针边界自检**：边界矩阵 + 协议不变量 + 三处实现一致性；本地/活两种模式；退出码可进 CI |
 | [lib/client.js](./lib/client.js) | 【生成物】客户端产物，勿手改 |
-| `test/*.test.mjs` + [test/helpers.mjs](./test/helpers.mjs) | 95 个守卫测试，全绿（协议/扫描/摘要/服务端到端/工具契约/装配/**HTTP 入口与端点来源**/客户端产物与面板） |
+| `test/*.test.mjs` + [test/helpers.mjs](./test/helpers.mjs) | 100 个守卫测试，全绿（协议/扫描/摘要/服务端到端/工具契约/装配/**HTTP 入口与端点来源**/客户端产物与面板） |
 
 **仍未落地（明确记录，不假装完成）**：`ctx.remote.$on` 推送（第一版一律轮询，这是取舍
 不是未知）、面板的真浏览器人工验收。注意"其它语言的探针桩"**不再是缺口**：任何能发 HTTP 的
@@ -167,6 +167,7 @@ debug-mode/
     ├── tools.test.mjs         ← 工具 schema 子集与返回值合规
     ├── ingest.test.mjs        ← HTTP 统一入口：协议一致、不可伪造、限额、CORS、GET 自检、浏览器桩、多语言片段
     ├── wiring.test.mjs        ← 命令 / 路由 / 提示词段落 / apply 装配
+    ├── changelog.test.mjs     ← §17 变更记录自身的守卫（连续无缺口 / 表头一致 / 日期合法不倒流）
     └── client-bundle.test.mjs ← 产物结构 + 迷你 hooks 渲染器
 ```
 
@@ -200,6 +201,16 @@ node scripts/probe-selfcheck.mjs   # 探针边界自检（退出码可进 CI；�
 > 会把管道里的 LF 转成 CRLF，于是每个文件看起来都「含 CR」——这是假阳性，会让人
 > 白改一轮。要按**字节**判断（`git show` 写进文件后数 `0x0D`）。
 > 本仓库的 `.gitattributes` 已把行尾锁成 LF，正常情况不需要人工干预。
+>
+> **改文档时不要拿"我要写的那一行"当锚点。** PowerShell 的 `String.Replace` 在锚点
+> 不存在时是**静默 no-op**（不报错、不失败、什么都不做）。实测因此**丢过两行 §17 变更
+> 记录**：版本号从 `0.11` 直接跳到 `0.18`，而表头还写着新版本——看表头以为记录齐了。
+> 改文档的脚本必须**先断言锚点出现且仅出现一次**再替换；`test/changelog.test.mjs` 现在
+> 把 §17 当数据来验（版本连续无缺口、表头 == 最新一行、日期合法且不倒流）。
+>
+> **日期以系统时钟为准，不要沿用相邻行的。** 实测把 `2026-10-11` 的多次改动全写成了
+> `2026-02-19`——因为每加一行都复制了上一行的日期。要查真实时间用
+> `git log --date=format:'%Y-%m-%d %H:%M'`，或直接 `Get-Date`。
 
 依赖安装（若将来需要）：使用 DSH 运行时自带的 Node 与 pnpm，
 不要用系统里可能存在的其它版本（见 `load_workspace_dependencies` 返回的路径）。
@@ -245,6 +256,10 @@ DSH 有两条互不相通的客户端通道，API 名一样、能力完全不同
 2. 改 `lib/protocol.js` / `lib/task.js`；
 3. 若涉及桩，同步 `assets/probe.template.mjs`，并让 `test/protocol.test.mjs`
    能证明两处实现一致。
+
+**§17 的形态是硬约束**（`test/changelog.test.mjs` 会验）：行序**新→旧**、版本号从 0.1
+**连续无缺口**、表头「设计冻结稿（vX.Y）」必须等于表里最新那一行、日期合法且不倒流
+（也不在未来）。"改了版本号却没留一行"正是这个测试要抓的历史事故。
 
 ---
 
