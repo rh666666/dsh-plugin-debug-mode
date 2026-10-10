@@ -39,6 +39,31 @@ test('§17 变更记录：版本号连续无缺口（"改了版本号却没写�
   assert.deepEqual(missing, [], `§17 缺这些版本的行：${missing.join('、')}（改了版本号就必须留一行）`)
 })
 
+test('§17 变更记录：没有"被粘在别人行里"的版本行（一行只能有一个版本行标记）', async () => {
+  // 实测事故：两条记录被写成了**字面量 `n**（反引号 + n）而不是真换行，于是它们
+  // 整段躺在 v0.14 那一行的正文里——`^\| 0\.\d+ \|` 这类锚定行首的检查**完全看不见它们**，
+  // 表面上"版本连续"，实际那两版从来没成为表格行。所以这里数的是**每行有几个**版本行标记。
+  const text = await readFile(join(REPO, 'DESIGN.md'), 'utf8')
+  const offenders = []
+  for (const [index, line] of text.split('\n').entries()) {
+    const markers = line.match(/\| 0\.\d+ \|/g) ?? []
+    if (markers.length > 1) offenders.push(`第 ${index + 1} 行有 ${markers.length} 个：${markers.join(' ')}`)
+    if (line.includes('`n| 0.')) offenders.push(`第 ${index + 1} 行出现字面量 \`n 紧接版本行标记`)
+  }
+  assert.deepEqual(offenders, [], `版本行被粘住了：\n${offenders.join('\n')}`)
+})
+
+test('§17 变更记录：表头到表尾之间不许夹非表格行（否则中间的行不会被当成记录）', async () => {
+  const text = await readFile(join(REPO, 'DESIGN.md'), 'utf8')
+  const lines = text.split('\n')
+  const first = lines.findIndex((line) => /^\| 0\.\d+ \| \d{4}-\d{2}-\d{2} \|/.test(line))
+  const last = lines.map((line) => /^\| 0\.\d+ \| \d{4}-\d{2}-\d{2} \|/.test(line)).lastIndexOf(true)
+  assert.ok(first >= 0 && last > first, '没找到 §17 的版本行区间')
+  for (let index = first; index <= last; index += 1) {
+    assert.ok(lines[index].startsWith('|'), `第 ${index + 1} 行夹在版本行之间却不是表格行：${lines[index].slice(0, 60)}`)
+  }
+})
+
 test('§17 表头的版本号 == 表里最新那一行（否则表头是空头支票）', async () => {
   const { rows, header } = await readChangelog()
   assert.ok(header, '没找到「设计冻结稿（vX.Y）」表头')
