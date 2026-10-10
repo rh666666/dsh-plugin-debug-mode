@@ -4,7 +4,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -141,6 +141,35 @@ test('renderProbeStub 烘死 hash 与日志绝对路径，且桩能真的写出�
     assert.equal(records[1].level, 'warn')
     // 探针不许因为坏负载而抛异常
     assert.doesNotThrow(() => probeModule.probe('p', (() => { const c = {}; c.c = c; return c })()))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('探针桩在日志达到 16 MiB 上限后停止追加，并只写一条 overflow 说明（§11.2）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-debug-mode-cap-'))
+  try {
+    const logAbs = join(dir, 'cap.log')
+    const stubAbs = join(dir, 'probe.mjs')
+    await writeFile(stubAbs, await renderProbeStub({ hash: 'cafebabe', logAbsolutePath: logAbs }), 'utf8')
+    // 直接把日志"垫"到上限：这是宿主的冻结阈值，测试必须钉住它，
+    // 否则某天有人把上限调大/调小，没有任何东西会红。
+    const limit = 16 * 1024 * 1024
+    await writeFile(logAbs, Buffer.alloc(limit, 0x0a))
+    const before = (await stat(logAbs)).size
+
+    const { probe } = await import(pathToFileURL(stubAbs).href)
+    probe('src/a.ts:1:enter', { value: 1 })
+    const afterFirst = (await stat(logAbs)).size
+    assert.ok(afterFirst > before, '到顶时必须写一条 overflow 说明')
+
+    probe('src/a.ts:2:enter', { value: 2 })
+    const afterSecond = (await stat(logAbs)).size
+    assert.equal(afterSecond, afterFirst, 'overflow 只写一次，之后一律停手（不许把磁盘写满）')
+
+    const text = await readFile(logAbs, 'utf8')
+    assert.ok(text.includes('debug-mode:overflow'))
+    assert.ok(text.trimEnd().endsWith('}'))
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

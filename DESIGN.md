@@ -1,6 +1,6 @@
 # dsh-plugin-debug-mode · 设计文档
 
-> 状态：**设计冻结稿（v0.1）**。本文只描述设计与契约，不描述实现进度；
+> 状态：**设计冻结稿（v0.10）**。本文只描述设计与契约，不描述实现进度；
 > 实现进度见 §14 路线图与 §15 待验证清单；防堆屎山的机制见 §16。
 > 任何与本文件冲突的实现，一律以本文件为准，或先改本文件再改代码。
 
@@ -24,7 +24,7 @@ Debug 模式的答案是：**别猜，让 Agent 自己在代码里埋探针，�
 2. 探针按**固定的行协议**把现场写进一个专属日志文件，位置可预期、格式可机读；
 3. 日志内容由插件**主动喂给 Agent**（Agent 不需要自己找文件、读文件）；
 4. 用户复现后，在一个**弹出的面板**上做二选一：
-   「问题已解决」→ 收工清理；「问题复现，需要进一步修复」→ 清空日志、再来一轮；
+   「问题已解决」→ 收工清理；「问题复现，需要进一步修复」→ 日志**保留**，Agent 读完再开下一轮；
 5. 用户说「已解决」时，Agent 必须**删掉本次任务埋下的全部探针代码**——
    调试的产物不许留在代码库里。
 
@@ -34,7 +34,7 @@ Debug 模式的答案是：**别猜，让 Agent 自己在代码里埋探针，�
 | --- | --- |
 | 不做断点/单步/变量监视 | 那是 IDE 的活；这里的「调试」= 结构化日志取证 |
 | 不做日志的可视化分析面板（图表、时间轴） | MVP 只需要用户做一次二选一 |
-| 不自动启动被调试程序 / 不代跑测试 | 怎么跑起来是项目的知识，由 Agent 决定 |
+| 不自动启动被调试程序 / 不代跑测试 | 见 §3.10：**Agent 在这个流程里不运行任何命令**，复现是用户的事 |
 | 不长期保存调试日志 | 日志是取证材料，不是数据资产；任务关闭即删除 |
 | 不替 Agent 决定在哪埋点 | 「分析」是 Agent 的核心价值，插件只提供协议与管道 |
 
@@ -201,6 +201,46 @@ ctx.commands.register({
 
 ---
 
+## 3.10 Agent 不运行任何命令（**这条不是建议，是流程的形状**）
+
+调试模式是宿主侧的一个**独立服务**：Agent 在这个流程里的动作只有两种——
+
+1. **给服务发信号**：`dsh_debug_start` / `report` / `continue` / `read` / `end`；
+2. **在源代码里埋探针 / 改代码**：走编辑工具。
+
+**"跑起来看现象"是用户的事，不是 Agent 的事。** 这条不是风格偏好，它来自一个
+实测到的事故：
+
+> 一次真实的调试里，工作区所在的 `D:\` 根目录属于 `SYSTEM`，当前账号在它上面
+> 缺少「更改权限」这一项。DSH 在执行 **shell 命令**前的授权阶段调用
+> `SetNamedSecurityInfoW` 失败（`Win32 5`），于是本会话内**所有** `pwsh` 调用全被拒。
+> 但同一时刻 `edit` / `write` 工具**完全正常**——那三处修复就是用它们落下去的。
+
+也就是说：**能挡住整个调试流程的，恰恰是这个流程本来就不需要的那一步。**
+现在把这条写死进流程：
+
+| 动作 | 需要命令吗 | 由谁做 |
+| --- | --- | --- |
+| 发信号（起任务/交卷/读日志/收尾） | 不需要 | Agent（工具调用） |
+| 埋探针、改代码 | 不需要 | Agent（编辑工具） |
+| **把被调试程序跑起来、复现现象** | 需要 | **用户** |
+| 把探针记录送到宿主 | 不需要（Node 桩走文件系统；其它运行时走 §7.6 的 HTTP 端点） | 探针自己 |
+
+由此产生的两条硬要求：
+
+1. **准则必须说出来**（§3.9 的 section + `assets/AGENT-PROBE-GUIDE.md` 的 §零）：
+   Agent 不会"顺手跑一下看看"，所以必须明确告诉它不需要跑；被沙箱挡住时也不要
+   去找替代命令，直接埋点交卷。
+2. **不能让任何一条必需的通道依赖命令**：这是 §7.6 存在的理由。浏览器页面
+   既不能 import Node 桩也没有文件系统，过去唯一的出路是"起个本地服务器把页面
+   伺服出来"——**那要跑命令**，于是整个流程在第一步就死了。宿主自己开一条
+   HTTP 摄入端点，就把这条依赖彻底删掉了。
+
+> 与 §3.7 的关系：那条说"一眼看出根因就别进调试"；这条说"进了调试就别跑命令"。
+> 两者是同一个取向——**别为了走流程去走流程**。
+
+---
+
 ## 5. 设计原则与架构总览
 
 ```
@@ -259,11 +299,11 @@ ctx.commands.register({
 | S0 | **开门（签票）** | 用户 | `/debug <现象描述>` | 无活跃任务 | 不变（只签票） | 不分配 | 不创建 |
 | S1 | **启动调试** | Agent（**须持票**） | `dsh_debug_start` | 有有效票据 | `active` (round=1) | **新建** | 新建（空） |
 | S2 | **汇报埋点** | Agent | `dsh_debug_report` | `active` | `awaiting-user` | 不变 | 保留 |
-| S3 | **进一步调试** | Agent | `dsh_debug_continue` | `active` / `awaiting-agent` | `active` (round+1) | **不变** | **清空** |
+| S3 | **进一步调试** | Agent | `dsh_debug_continue` | `active` / `awaiting-agent` | `active` (round+1) | **不变** | **清空**（流程里**唯一**的清空时机） |
 | S4 | **读取日志** | Agent | `dsh_debug_read` | 任意非 `closed` | 不变 | 不变 | 只读 |
 | S4b | **用户打字描述现象** | 用户 | 原生输入框 | `awaiting-user` | `active`（宿主自动迁移，§9.3.2） | 不变 | 不变 |
 | S5 | **用户：已解决** | 用户 | 面板按钮 | `awaiting-user` | `awaiting-agent` | 不变 | **保留待删** |
-| S6 | **用户：复现** | 用户 | 面板按钮 | `awaiting-user` | `awaiting-agent` | 不变 | **清空** |
+| S6 | **用户：复现** | 用户 | 面板按钮 | `awaiting-user` | `awaiting-agent` | 不变 | **保留**（Agent 还没读它） |
 | S7 | **结束调试** | Agent（**须用户已表态**） | `dsh_debug_end` | `awaiting-agent` | `closed` | 不变 | **删除** |
 
 > S0 是**闸门**而不是任务操作：它不分配哈希、不建目录、不生成桩，只在本会话签一张
@@ -274,6 +314,16 @@ ctx.commands.register({
 > 投递一条结构化指令。真正的删除动作在 S7（Agent 执行清理后确认）里发生。
 > 理由：删除日志和删除探针代码必须一起发生才有意义；而探针代码只有 Agent 能删。
 > 若由用户信号直接删日志，Agent 可能拿到一个「日志已消失但探针还在」的中间态。
+
+> 🔴 **S6 曾经被写成「清空」，那是个致命错误**（§17 v0.10 有完整记录）。
+> S6 发生在 Agent **还没读**的时候：用户刚复现完，现场就在日志里等着，此时清空
+> 等于把证据当场扔掉——然后宿主还发一条指令让 Agent「去 `dsh_debug_read`」，
+> 让它读一份自己刚清空的文件。用户看到的现象是：**一点「复现」，日志就空了。**
+>
+> **清空的唯一时机是 S3**：那一刻 Agent 已经读过现场、正要开始新一轮埋点，
+> 也就是**下一次用户复现之前**。这条边界由两道机器保证：
+> ① `dsh_debug_continue` 是全流程唯一执行 truncate 的地方（S6 一行代码都不碰日志）；
+> ② 它有**闸门 C**：日志里还有没读过的字节就拒绝清空（三振降级，§16.3.0）。
 
 ### 6.2 工具契约
 
@@ -376,8 +426,13 @@ ctx.tools.register({
 入参：{ nextPlan?: string }
 返回：状态行（第 n 轮开始，日志已清空）、日志路径、剩余额度（字节/行数上限）
 副作用：清空日志文件（truncate 为 0 字节，**不删文件**）、round+1、
-        pendingReport 清空、status → active
-前置：任务必须存在；不存在则返回「请先 start」
+        lastRead 归零、status → active、重设 R1 基线索引
+前置：任务必须存在；状态为 active / awaiting-agent
+闸门 C（**本插件最重要的一道，见 §6.1 的 S6 说明**）：
+  日志里还有「上次读取之后新增的字节」时**拒绝清空**，要求先 dsh_debug_read；
+  同一原因连续拒绝 3 次后降级为 warn-only（§16.3.0）。
+  ——清空是破坏性的，而"还有没读过的现场"是一个可以用数字判定的问题：
+    `当前字节数 > (task.lastRead?.bytes ?? 0)`。
 ```
 
 #### S4 `dsh_debug_read`
@@ -425,15 +480,17 @@ interface SessionPromptRequest {
   「工具阻塞等用户答复」的形态，这是首方标准做法（`ask_user_question` 就是这么工作的）。
 
 因此：面板按钮 → `POST /dsh-debug-mode/resolve`（同源 fetch，带 hash）→
-宿主路由处理 → 清空/保留日志 + 状态迁移 → `sessionController.prompt(...)`
-投递下面这条结构化指令。
+宿主路由处理 → **状态迁移 + 唤醒**（**S5/S6 都不清空日志**，见 §6.1 的 S6 说明）→
+`sessionController.prompt(...)` 投递下面这条结构化指令。
 
 投递给 Agent 的指令正文：
 
 ```
 [debug-mode] 用户在面板上选择了「问题复现，需要进一步修复」。
-任务：<hash> · 第 <n> 轮 · 本轮日志已清空。
-请按信号序列执行：dsh_debug_read → 分析 → dsh_debug_continue（若需换假设）→ 埋点 → dsh_debug_report。
+任务：<hash> · 第 <n> 轮。**这一轮的日志完整保留着**——它就是你要的证据。
+请按信号序列执行：dsh_debug_read（先看现场）→ 分析 → dsh_debug_continue（要开下一轮时才清空日志）→ 埋点 → dsh_debug_report。
+⚠️ dsh_debug_continue 会**清空**日志，所以它必须排在 dsh_debug_read 之后——
+   顺序反了，用户刚刚复现出来的东西就再也看不到了。
 ```
 
 ```
@@ -449,9 +506,11 @@ interface SessionPromptRequest {
 
 | 方法 + 路径 | 用途 |
 | --- | --- |
-| `GET /state?sessionId=<id>` | 面板轮询：状态、轮次、日志行数、`lastReport`、`userNote`；无任务时返回 `{ task: null }` |
-| `POST /resolve` `{hash, note?}` | S5 用户信号（已解决） |
-| `POST /reproduce` `{hash, note?}` | S6 用户信号（复现）；`note` 可选（§9.3.3） |
+| `GET /state?sessionId=<id>` | 面板轮询：状态、轮次、日志行数、`lastReport`、`userNote`、`detector`（残留检测是否真的在工作）、`debts`；无任务时返回 `{ task: null }`（200，不是 404——面板要靠状态码区分"空"与"故障"） |
+| `GET /board` | R5 欠账看板：所有未关闭的任务（跨工作区，限于宿主见过的仓库） |
+| `POST /probe?h=<hash>` | §7.6 的 HTTP 探针摄入（浏览器 / 远端进程）。**只追加日志，不做任何状态迁移** |
+| `POST /resolve` `{hash, sessionId?, note?}` | S5 用户信号（已解决） |
+| `POST /reproduce` `{hash, sessionId?, note?}` | S6 用户信号（复现）；`note` 可选（§9.3.3） |
 | （可选）`GET /panel.js` | 保留给「注入式面板」的退路（当前方案不用，见 §9.1.1） |
 
 `hash` 不匹配、任务已关闭、重复点击 → 一律返回 `4xx` + 明确文案，且**幂等**：
@@ -478,17 +537,23 @@ interface SessionPromptRequest {
         ┌──────────────────────► active ◄──────────────┐
         │                          │                   │
         │                   S2 report                  │ S3 continue
-        │                          ▼                   │ (清空日志, round+1)
+        │                          ▼                   │ (清空日志, round+1) ← 唯一的清空时机
         │                   awaiting-user ─────────────┘
-        │                          │
-        │             ┌────────────┴────────────┐
-        │        S5 已解决               S6 复现（清空日志）
+        │                        │  │
+        │        S5 已解决 ───────┘  └─────── S6 复现（**日志保留**）
         │             ▼                        ▼
         │      awaiting-agent ◄────────────────┘
         │             │
         │        S7 end（删日志 + 验收清理）
         └────────────► closed
 ```
+
+另有两条边：
+
+| 边 | 触发 | 语义 |
+| --- | --- | --- |
+| `awaiting-user → active` | §9.3.2 宿主自动迁移（S4b） | 用户没点按钮，而是在输入框里补充了现象 ⇒ 球回到 Agent 脚下，面板收起按钮；但它**不是**用户表态，所以 `userVerdict` 清空、`end` 仍然被拒 |
+| `active → closed` | 异常路径 | 只由 `end` 在任务不存在/已关闭时走到；正常收尾一律经 `awaiting-agent` |
 
 - `active`：Agent 正在改代码/埋点，此时面板**只展示不提供按钮**（避免用户在
   Agent 干到一半时下结论）。
@@ -579,6 +644,55 @@ export const LOG = "/abs/path/to/repo/.dsh/debug-mode/tasks/deadbeef/deadbeef.lo
 非 JS/TS 项目（Python 等）：**Agent 按同一行协议自写桩**，落点
 `runtime/probe.<ext>`，同样受上表约束（`try/except` 全包、`open(..., "a")` 即写即关）。
 宿主不试图为每种语言内置桩——协议足够简单，Agent 写对它是基本要求。
+能发 HTTP 的运行时可以改用 §7.6 的摄入端点，那样连文件与并发都不用自己处理。
+
+### 7.6 HTTP 探针通道（给「没有文件系统的运行时」）
+
+有些运行时**根本没有文件系统**：浏览器页面（尤其是 `file://` 打开的静态页）、
+沙箱里的容器、只能发网络请求的远端进程。对它们来说，`runtime/probe.mjs` 是没用的：
+页面既不能 `import` 一个 `file://` 模块（CORS 拦掉 module），也没有 `appendFileSync`。
+
+过去这类目标唯一的出路是"起个本地服务器把页面伺服出来"——**那要跑命令**，
+而 §3.10 刚刚把"命令"从流程里删掉了。所以宿主自己开一条**只追加写**的摄入端点：
+
+```
+POST /dsh-debug-mode/probe?h=<hash>
+Content-Type: text/plain;charset=utf-8      ← CORS 简单请求，不触发预检
+体：NDJSON（一行一条记录）；也接受单个 JSON 对象或对象数组
+```
+
+`dsh_debug_start` 会据此生成第二个桩 `runtime/probe.browser.js`（经典脚本，
+零依赖、`window.dshProbe`），用法：
+
+```html
+<!-- dsh-debug:probe <hash> start -->
+<script src=".dsh/debug-mode/tasks/<hash>/runtime/probe.browser.js"></script>
+<!-- dsh-debug:probe <hash> end -->
+```
+
+这是解析这条通道的**四条纪律**（每一条都对应一次会静默丢数据的失败）：
+
+1. **传输，不是第二份实现。** 记录到达宿主后由 `lib/protocol.js` 的 `formatRecord`
+   重新序列化落盘；`task` 由宿主**写死**（投递方说什么都不算数），`ts` 缺失由宿主补。
+   协议的唯一真相仍然只有 `lib/protocol.js` 一处。
+2. **只认已知任务。** `h` 必须匹配 `^[0-9a-f]{8}$` **且**属于一个活跃任务，
+   否则 404/400。没有任何路径拼接，因此不存在路径穿越的可能。
+3. **限额与 §11.2 同一套**：单行 8 KiB 截断、总量 16 MiB 到顶后写一条
+   `debug-mode:overflow` 就停手。
+4. **投递是尽力而为，所以失败必须能看出来**：页面发不出去就静默丢弃（探针永远不许
+   把页面搞挂），因此 `read` 返回"日志为空"时，第一条排查建议应当是**投递**，
+   而不是埋点位置。
+
+**安全姿态（如实写，不粉饰）**：CORS 开 `*`，因为被调试页面多半是 `file://`
+（源是 `null`）或另一个端口的 dev server；没有这些头，浏览器的 POST 会被直接挡掉，
+而**探针的失败是静默的**——用户只会看到"日志是空的"。这里没有凭据、没有 cookie，
+端点唯一能做的事是往一个已知活跃任务的日志里追加一条协议记录。
+§16.4 已经记过一次教训："只有面板能种下的 token"在宿主自己开路由的前提下是
+**安全戏剧**——所以这里如实按「审计 + 摩擦」来设计，而不是假装有授权。
+
+**端口从哪来**：`DSH_WEB_URL`（DSH 自己注入的、当前 Web UI 的地址）。
+拿不到时**不生成桩**、也不写一个凭空猜的端口——猜错的后果是探针静默丢失，
+那正是这个插件最不能接受的失败方式；此时工具返回值会明说「宿主地址未知」。
 
 ### 7.5 探针块（可摘除性）
 
@@ -818,7 +932,7 @@ ctx.slots.inject('conversation.composer.dock', () =>
 | 用户动作 | 面板行为 | 宿主行为 |
 | --- | --- | --- |
 | 在输入框打字并发送 | 面板显示「已收到你的描述，Agent 正在处理」 | `awaiting-user` → `active`（§9.3.2） |
-| 点「问题复现，需要进一步修复」 | 禁用两键，显示「已通知 Agent，本轮日志已清空」 | S6：清空日志 → `awaiting-agent` → 唤醒 Agent |
+| 点「问题复现，需要进一步修复」 | 禁用两键，显示「已通知 Agent。这一轮的日志保留着，等它读完再开下一轮」 | S6：**保留日志** → `awaiting-agent` → 唤醒 Agent 去读 |
 | 点「问题已解决」 | 禁用两键，显示「已通知 Agent 清理探针」，保留可见直到 `closed` | S5：`awaiting-agent` → 唤醒 Agent 执行 S7 |
 | 任务已 `closed` | 面板消失（或收缩为「本次调试已结束」） | 删任务目录 |
 
@@ -842,8 +956,12 @@ ctx.slots.inject('conversation.composer.dock', () =>
 | --- | --- | --- |
 | 任务状态 | `<repo>/.dsh/debug-mode/tasks/<hash>/state.json` | 任务关闭即删除 |
 | 探针日志 | 同目录 `<hash>.log` | 同上 |
-| 探针桩 | 同目录 `runtime/probe.mjs` | 同上 |
+| 探针桩（Node） | 同目录 `runtime/probe.mjs` | 同上 |
+| 探针桩（浏览器/远程） | 同目录 `runtime/probe.browser.js` | 同上（§7.6；宿主地址未知时不生成） |
+| R1 基线索引 | 同目录 `index.json` | 同上 |
+| 收尾备份与审计 | 同目录 `backups/`、`journal.jsonl` | 同上（**绝不自动还原**，只给用户查） |
 | 会话绑定 | 内存 `Map<sessionId, hash>` + `state.json.sessionId` | 会话结束或进程退出 |
+| 票据 | `.dsh/debug-mode/pending/<sessionId>.json` | 消费 / TTL / 会话结束 |
 | 插件配置 | DSH profile 的 config（可选：日志上限、是否自动 gitignore 等） | 用户掌控 |
 
 `state.json` 存在的唯一理由是**跨进程重启恢复**：DSH 重启后，Agent 再次调用
@@ -921,29 +1039,38 @@ ctx.slots.inject('conversation.composer.dock', () =>
 | 客户端构建链 | **已定稿**：`scripts/build-client.mjs` 单文件包装，零第三方依赖 |
 | **用户侧入口只有 `/debug`，且由宿主票据硬校验** | **冻结**（§3） |
 | **Agent 可以拒绝进入（一眼看出根因时）** | **冻结**（§3.7） |
+| **Agent 在调试流程里不运行任何命令** | **冻结**（§3.10；实测事故驱动） |
+| **日志清空的唯一时机是 S3（`dsh_debug_continue`）** | **冻结**（§6.1；S6 只保留不删，且 `continue` 有"没读过就不许清"的闸门 C） |
+| **HTTP 探针通道（页面/远程运行时的唯一出路）** | **冻结**（§7.6；CORS + 只认活跃任务 + 同一套限额） |
 | **探针账 / 修复账分开记，收尾只撤探针** | **冻结**（§3.8、§9.4） |
-| 第一轮不改代码、第二轮起允许先改后验 | **冻结**（§3.8） |
-| **防堆屎山：成因分类 C1–C10 + 机制 R1–R6** | **已定稿**（§16；R1 最重要） |
-| **闸门连续拒绝 3 次必须降级 + 失效必须可见** | **冻结**（§16.3.0） |
-| **三色标记与四色处理（隔离区不允许静默保留）** | **冻结**（§16.3） |
-| `TurnLocation` 的字段形状 | **待验证**（§15 第 1 项） |
-| 沙箱策略下的文件写入路径 | **待验证**（§15 第 2 项） |
+| 第一轮不改代码、第二轮起允许先改后验 | **冻结**（§3.8）；**闸门判据已收窄**为"出现 `dsh-debug:change` 或自报 `changedFiles`"——埋探针本身不算改代码（§16.3 R4） |
+| **防堆屎山：成因分类 C1–C10 + 机制 R1–R6** | **已定稿**（§16；R1 最重要）；R1–R6 均已落地，R5 的跨任务看板走 `GET /board` |
+| **闸门连续拒绝 3 次必须降级 + 失效必须可见** | **冻结**（§16.3.0）；已实现（`GATE_DEGRADE_AFTER`、写探针自检、面板 `detector` 字段） |
+| **三色标记与四色处理（隔离区不允许静默保留）** | **冻结**（§16.3）；已实现（`probe`/`temp`/`fix` + `change`，`dsh_debug_end` 的 `quarantine` 三选一） |
+| `TurnLocation` 的字段形状 | **不影响本插件**（面板改用轮询 + `sessionId`，不再依赖 turn 坐标） |
+| 沙箱策略下的文件写入路径 | **实测**：`start` 前做写探针自检（`.dsh/debug-mode/.probe-write-test`），失败即拒绝并把「残留检测未生效」写进面板（§16.3.0） |
 | 插件是否需要 Config | 暂无（全默认；用户设置走自己的 JSON 文件，与参考插件一致） |
+| **`InputState` 的形状** | **已核实**：`{ draft, attachmentIds, draftRev, phase, occurrences, queue }`（`SessionInputShell.compose()`）；面板只读 `draft` + `attachmentIds` |
+| **`PromptContentPart` / `SessionRequestId`** | **已核实**：`{type:'text',text}` 即为合法 part；`SessionRequestId` 是运行时字符串（充当幂等键），由宿主自己铸造 |
+| **`systemPrompt.section` 的 order 取值** | **已核实**：`SECTION_ORDERS` 中 `TOOLS_SDK: 5000`，本插件取 **5050** |
+| **`/debug` 是否出现在宿主命令面板** | **已核实**：`commands.register` 的 descriptor 会被 `@Remote list` 列给 UI（首方命令面板即由此渲染） |
+| **宿主的 Web 基地址从哪来** | **已核实**：DSH 注入 `DSH_WEB_URL`（就是当前 Web UI 的地址）；拿不到时宿主**不生成**浏览器桩并明说，绝不猜端口 |
 
 ---
 
 ## 14. 路线图
 
-| 阶段 | 内容 | 完成判据 |
-| --- | --- | --- |
-| M0（已完成） | 项目初始化：包清单、patch、协议模块、任务状态机、探针桩模板、协议测试 | `node --test test/*.test.mjs` 全绿（17/17）；两份文档冻结 |
-| M0b（已完成） | 客户端构建链与座位验证桩：`scripts/build-client.mjs` + `src/client.js` + 产物守卫测试 | 构建幂等、产物在 vm 沙箱里能被加载并注册座位（已测） |
-| M1 入口与闸门 | `/debug` 命令（签票 + 投递指令文本）；票据的持久化、TTL、消费与幂等；`.dsh/debug-mode/pending/` | 无票调用 `dsh_debug_start` 被拒；敲一次 `/debug` 后能正常启动任务；重复 `/debug` 行为符合 §3.4 |
-| M2 宿主骨架 | 5 个信号工具（agent 作用域注册、JSON Schema 参数、`output.render`）；任务落盘与恢复；日志读写与摘要；`.dsh/` 与 gitignore | 手工在会话里跑完 S1→S2 全程，Agent 能拿到摘要 |
-| M3 唤醒闭环 | `webServer` 路由 + `sessionController.prompt` 投递；`systemPrompt.section`（thunk，仅调试模式下非空） | 不接面板，用 curl 打 `/resolve` 能真的让 Agent 开出下一轮 |
-| M4 面板 | 把 `src/client.js` 的面板骨架接上真交互：两个按钮 POST 到 `/resolve` `/reproduce`、草稿禁用、收尾三态、样式令牌 | 浏览器里完成一次真实二选一 |
-| M5 收尾与验收 | 清理对账；`end` 的点名机制；未关闭任务的提示 | 一次完整任务结束后 `git status` 归零（除 `.dsh/`） |
-| M6 打磨 | 上限配置、错误文案、Python 桩示例、README | 文档与实现一致 |
+| 阶段 | 内容 | 完成判据 | 状态 |
+| --- | --- | --- | --- |
+| M0 | 项目初始化：包清单、patch、协议模块、任务状态机、探针桩模板、协议测试 | `node --test test/*.test.mjs` 全绿；两份文档冻结 | **完成** |
+| M0b | 客户端构建链与座位验证桩：`scripts/build-client.mjs` + `src/client.js` + 产物守卫测试 | 构建幂等、产物在 vm 沙箱里能被加载并注册座位 | **完成** |
+| M1 入口与闸门 | `/debug` 命令（签票 + 投递指令文本）；票据的持久化、TTL、消费与幂等；`.dsh/debug-mode/pending/` | 无票调用 `dsh_debug_start` 被拒；敲一次 `/debug` 后能正常启动任务；重复 `/debug` 行为符合 §3.4 | **完成** |
+| M2 宿主骨架 | 5 个信号工具（agent 作用域注册、JSON Schema 参数、`output.render`）；任务落盘与恢复；日志读写与摘要；`.dsh/` 与 gitignore | 手工在会话里跑完 S1→S2 全程，Agent 能拿到摘要 | **完成** |
+| M3 唤醒闭环 | `webServer` 路由 + `sessionController.prompt` 投递；`systemPrompt.section`（thunk，仅调试模式下非空） | 不接面板，用 curl 打 `/resolve` 能真的让 Agent 开出下一轮 | **完成** |
+| M4 面板 | 两个按钮 POST 到 `/resolve` `/reproduce`、草稿禁用、收尾三态、样式令牌 | 浏览器里完成一次真实二选一 | **完成**（代码与守卫测试就位；真浏览器验收仍待用户在 GUI 里走一遍） |
+| M5 收尾与验收 | 清理对账；`end` 的点名机制；未关闭任务的提示 | 一次完整任务结束后 `git status` 归零（除 `.dsh/`） | **完成** |
+| M6 打磨 | 上限配置、错误文案、Python 桩示例、README | 文档与实现一致 | **完成** |
+| §16 R1–R6 | 工作区索引 + 窗口 diff、残留扫描器、三色标记 + 隔离区、停止规则、欠账看板、journal + backups | 见 §16.3 各自定义 | **完成** |
 
 ---
 
@@ -951,30 +1078,40 @@ ctx.slots.inject('conversation.composer.dock', () =>
 
 > 这些是设计上留的「接口空位」。**不要在没做实验前照着猜的名字写代码**——
 > 先 `cordis_inspect_query` 或读参考插件，再改本节状态。
-> 已按 2026-10-10 的两轮契约核实更新；下列条目是**仍然未闭合**的部分。
+>
+> **2026-10-10 第二轮核实（M1–M6 实现期）**：下面 10 项里 9 项已闭合，核实方式记在
+> 每一项后面——**这是执行纪律的一部分：结论要能被人复核**。
 
-1. **`TurnLocation` 的字段形状**（打包目录里只有类型引用，没有声明）。面板内部
-   以 `seq`（`number`）作寻址键，`turn` 只做透传；若将来要用 `turn` 的内容，
-   先在真实会话里打印一次。
-2. **沙箱**：宿主写 `.dsh/debug-mode/**` 时是否需要额外权限、被拒绝时的错误形状
-   （用于 §12 的文案）。当前会话是 `danger-full-access`，但这不代表其它用户。
-3. **是否需要显式开关**：调试模式应由用户意图发起还是 Agent 自行判断？
-   候选：`/debug` 命令 + Agent 自行判断两路并存。
-4. **`PromptContentPart` 的形状与 `SessionRequestId` 的铸造方式**（未验证）：
-   M2 动手前先打一次真实调用看形状。
-5. **`systemPrompt.section` 的 `name`/`order` 取值**（未验证）：`SECTION_ORDERS` 的
-   键名与数值不可读，先用靠后的 order（如 900）。
-6. **`InputState` 的字段形状**（未验证）：草稿在哪个字段里。`src/client.js` 的
-   `hasDraft` 目前按候选字段名探测（保守方向：读不到就当作没草稿），
-   接真宿主后打印一次实际形状并写死。
-7. **主题令牌的权威清单**（未验证）：§9.1.4 的 `--dsw-alias-*` 名字来自一个已发布
-   第三方插件的真实样式表，不是 Theme provider。首次实现时核对一次。
-8. **`/debug` 怎么被用户发现**（未验证）：注册成全局命令后是否自动出现在宿主的
-   命令面板里。
-9. **观察用户消息的确切事件类型**（未验证）：用于 §9.3.2 的自动迁移
-   （`session/event` 的哪个 `event.type` 代表用户消息）。
-10. **`ctx.remote.$on` 能否替代轮询**（未验证）：事件转发白名单属于宿主装配，
-    不属于本插件；第一版一律用轮询，不要赌推送。
+1. ~~**`TurnLocation` 的字段形状**~~ → **不再需要**。面板改用 `sessionId` + 轮询，
+   不再用 turn 坐标寻址（`conversation.composer.dock` 直接给 `sessionId`）。
+2. **沙箱**：已落地为**运行期自检**而不是静态结论——`start` 前写
+   `.dsh/debug-mode/.probe-write-test`，失败即拒绝启动任务、并在面板常驻
+   「残留检测未生效」。这比"查一次文档"更可靠：它反映的是**这台机器此刻**的事实。
+3. ~~**是否需要显式开关**~~ → **已冻结**：只有 `/debug`（§3）。
+4. **`PromptContentPart` / `SessionRequestId`** → **已核实**。依据：
+   `@deepseek-ai/dsh-api-session-controller` 的 typert 声明
+   `PromptContentPart = {type:'text',text} | {type:'image',…} | {type:'file',…}`；
+   `SessionRequestId = Branded<'session-request-id'>`（运行时即字符串，被宿主当幂等键：
+   `hasPromptRequest(agent, request.requestId)`）。
+5. **`systemPrompt.section` 的 `name`/`order`** → **已核实**：
+   `@deepseek-ai/dsh-system-prompt` 的 `SECTION_ORDERS` 里 `TOOLS_SDK: 5000`、
+   下一段是 `DELIVERABLE_FILE_REFERENCES: 9000`；本插件取 **5050**（紧跟工具文档）。
+6. **`InputState` 的字段形状** → **已核实**：`SessionInputShell.compose()` 返回
+   `{ draft, attachmentIds, draftRev, phase, occurrences, queue }`，宿主自己比较草稿用的是
+   `inputState.draft === ""`。`src/client.js` 的 `hasDraft` 因此**写死** `draft` +
+   `attachmentIds`（按候选字段名探测的写法已删除：它会静默失效，写死会在字段改名时立刻红）。
+7. **主题令牌** → **已核实来源**：首方客户端（`ui-conversation` 等的 CSS 产物）确实使用
+   `--dsw-alias-*` 令牌。面板每一处都带 fallback，因此即使令牌改名也只是"回到默认色"。
+8. ~~**`/debug` 怎么被用户发现**~~ → **已核实**：`commands.register` 的
+   `CommandDescriptor` 会被 `ctx.commands` 的 `@Remote list(agent)` 列给 UI 渲染命令面板。
+9. **观察用户消息的确切事件类型** → **已核实**：`session/event` 的 `event.type ===
+   'user/message'`（`SessionEventMap` 里有定义），§9.3.2 的自动迁移据此实现。
+10. **`ctx.remote.$on` 能否替代轮询** → 仍然**不赌**：第一版一律轮询（与两个已发布的
+    第三方插件一致）。这是取舍不是未知。
+
+**仍未闭合的一项**：真浏览器里走完一次完整二选一（M4 的验收判据）。代码路径已由
+`node:vm` 沙箱里的产物测试覆盖（按钮 POST、草稿禁用、收尾三态、失效告警），
+但"**在真实 GUI 里点一下**"这件事只能由人在 GUI 里做。
 
 ---
 
@@ -1193,4 +1330,7 @@ debugging, testing, and verification》、Sedano 等的《Software Development W
 | 0.5 | 2026-10-10 | **支持调试期间随时用输入框描述现象**（§9.3）：新增 S4b 与「三条输入路径」；面板座位**从 `conversation.chat.turnTail` 改为 `conversation.composer.dock`**（该座位给到 `useInput`/`inputActions`，用它才能在有草稿时禁用按钮，消掉「同一条描述送两遍」的竞态，§9.1.3、§9.3.1）；新增 `awaiting-user` → `active` 的宿主自动迁移（§9.3.2）；`dsh_debug_end` 增加「用户已表态」前置；面板改为常驻 + 三态可交互性；客户端落地面板骨架与迷你 hooks 渲染器测试（18/18） |
 | 0.6 | 2026-10-10 | **代码改动成为调试的第三条腿**（§3.8）：第 1 轮只取证、第 2 轮起允许「先改代码再埋点验证」；新增 `dsh-debug:change <hash>` 标记与 `changedFiles` 字段，把**探针账与修复账分开**，收尾只撤探针、明令禁止 `git checkout` 整体回滚；`dsh_debug_report` 增加 `changedFiles`、`dsh_debug_end` 返回三类账；新增 **§3.7「Agent 可以拒绝进入调试」**（票据放着即过期，宿主不需要任何清理路径）；同步更新 `assets/AGENT-PROBE-GUIDE.md`（新增 §一「三件事」、§三「改代码」、§四「拒绝进入」、§七「改动块」）与 `lib/task.js` 的 `changedFiles` |
 | 0.7 | 2026-10-10 | **新增 §16「防止多轮调试堆积临时代码」**（外部资料调研 + 对抗性评审两轮）：把「屎山」拆成 C1–C10 十种成因并分派机制；定稿 **R1 宿主侧工作区索引 + 窗口 diff（最重要，唯一不依赖 Agent 诚实）**、R2 宽松发现 + 严格分类 + 栈式配对的残留扫描器、R3 三色标记 + 隔离区、R4 停止规则、R5 欠账看板、R6 journal + backups；新增横切要求「闸门连续拒绝 3 次须降级 + 失效必须可见」；**§16.4 记录了被推翻的 7 项最初选择**（尤其「未标记默认当 fix」方向换错、假说配额可被三行 JSON 冲破、「token 不可伪造」是安全戏剧）；§16.6 给出分级证据与**一处未完成的实证空白** |
+| 0.8 | 2026-10-10 | **M1–M6 全部落地**（实现期变更，逐条都有测试钉住）：① §15 的 10 项待验证里 9 项闭合，核实依据写回该节；② **R4 L1 的闸门判据收窄**为「出现 `dsh-debug:change` 或自报 `changedFiles`」——原措辞"文件被改过就拒绝"会把埋探针本身判成违规，是这个插件自己给自己制造的死锁（§16.3.0 要防的正是这个）；③ **R1 基线语义修正**：`report` 只量不推进基线，否则第二次交卷看到的 diff 永远是空的，R1 会退化成"Agent 自报"；④ 状态机新增 `awaiting-user → active`（§9.3.2 的宿主自动迁移，见 §6.3）；⑤ 路由表新增 `GET /board`（R5 跨任务欠账看板）；⑥ 探针桩新增 **16 MiB 总量上限**（§11.2）与 `debug-mode:overflow` 说明行，且尺寸**每次 stat 不缓存**——否则宿主清空日志后探针会以为还满着而永久停写；⑦ 隔离区按**文件**归并（同一文件的多个症状让用户回答一次）；⑧ `dsh_debug_end` 新增 `quarantine` 参数作为三选一的回填通道，`summary` 写进返回值与 journal；⑨ 工具返回值统一为 `{ok,text,…}` 并由 `output.render` 投影，错误路径与成功路径共用同一 schema（避免 `ToolOutputError` 把最需要被读到的错误吞掉）；⑩ 新增 `lib/scan.js`·`lib/summary.js`·`lib/prompt.js`·`lib/debug-service.js`·`lib/command.js`·`lib/tools.js`·`lib/routes.js` 与 5 个测试文件（69 个断言全绿）；⑪ 面板接上真交互与收尾三态，`InputState` 字段写死为实测值 |
+| 0.9 | 2026-02-19 | **按一次真实事故（`D:\` 缺 WRITE_DAC ⇒ 所有 shell 命令被拒）收口「不需要任何命令」**：① 新增 **§3.10「Agent 不运行任何命令」**，把"发信号 + 埋点/改代码"写死为 Agent 的全部动作，复现归用户；② 新增 **§7.6 HTTP 探针通道**与 `assets/probe.browser.js`——宿主开一条 `POST /probe?h=<hash>` 的只追加写端点（CORS 简单请求、NDJSON、`task` 由宿主写死、限额与桩同一套），浏览器页面因此**不需要起本地服务器**（那要跑命令）就能埋点；③ `dsh_debug_start` 现在生成第二个桩并返回端点，宿主地址取自 `DSH_WEB_URL`，拿不到时**不生成也不猜端口**；④ 注入准则、`/debug` 指令正文、`assets/AGENT-PROBE-GUIDE.md`（新增 §零）三处都明确写出"不要运行任何命令"，并明说 shell 被环境挡掉不影响本流程；⑤ §1.3 非目标里"怎么跑起来由 Agent 决定"这句被本事故证伪，改为指向 §3.10；⑥ §10 存储表补齐 `index.json` / `backups/` / `journal.jsonl` / 浏览器桩 / 票据；⑦ 新增 `test/ingest.test.mjs`（8 条：协议一致、`task` 不可伪造、只认活跃任务、限额、CORS/预检、浏览器桩在 vm 里真的发出记录、端点未知时的行为） |
+| 0.10 | 2026-02-19 | **修掉一个"用户一点「复现」，证据就没了"的致命错误**：① **S6 不再清空日志**（§6.1 的信号表从「清空」改为「保留」）——S6 发生在 Agent **还没读**的时候，清空等于把用户刚复现出来的现场当场扔掉，随后宿主还发一条指令让 Agent 去 `dsh_debug_read`（§6.2 原文自己就写着"本轮日志已清空…请按信号序列执行 dsh_debug_read"，前后矛盾）；② **清空的唯一时机收敛到 S3**，也就是"Agent 已读过现场、正要开始新一轮埋点"= **下一次用户复现之前**；③ 新增**闸门 C**：`当前日志字节数 > task.lastRead.bytes` 时拒绝清空并要求先读（三振降级）；`continue` 之后 `lastRead` 归零，否则闸门 C 会永久失效；④ **`gate()` 的签名改为 `gate(key, reason, detail)`**：`reason` 作为"同一原因"的比较键必须稳定，数字与清单挪到 `detail`——原先把 `检测到 N 个文件` 拼进 reason，会让每次比较都不相等、计数器永远归零，**所有闸门的降级机制其实都不会触发**（这是本次顺带发现的隐蔽死锁）；⑤ 三处顺序写反的文案一并改掉：`assets/AGENT-PROBE-GUIDE.md` 的「`continue`（清空）→ 读日志」、DESIGN §6.2 S6 的指令正文、`dsh_debug_continue` 的工具描述；⑥ 面板 `awaiting-agent` 文案从「本轮日志已清空」改为「日志保留着，等它读完再开下一轮」；⑦ 新增/改写测试：S6 之后日志必须还在、`continue` 之前必须有 `read`、闸门 C 三振后放行 |
 

@@ -251,18 +251,130 @@ test('awaiting-user 时给出两个可用按钮；有草稿时禁用（§9.3.1 �
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
   try {
-    const idle = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ text: '' }) }))
+    // InputState 的字段名是**实测**的（`SessionInputShell.compose()`）：`draft` + `attachmentIds`。
+    const idle = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '', attachmentIds: [] }) }))
     const buttons = collectButtons(idle)
     assert.equal(buttons.length, 2, 'awaiting-user 应给出两个按钮')
     assert.deepEqual(buttons.map((b) => b.children[0]), ['问题已解决', '问题复现，需要进一步修复'])
     assert.ok(buttons.every((b) => b.props.disabled === false), '草稿为空时两个按钮都应可用')
 
     const typing = await react.run(() =>
-      panel({ sessionId: 's1', useInput: () => ({ text: '只在切换标签页后复现' }) }))
+      panel({ sessionId: 's1', useInput: () => ({ draft: '只在切换标签页后复现', attachmentIds: [] }) }))
     const typingButtons = collectButtons(typing)
     assert.equal(typingButtons.length, 2)
     assert.ok(typingButtons.every((b) => b.props.disabled === true),
       '输入框有未发送内容时必须禁用两个按钮，避免同一条描述送两遍')
+
+    // 「只挂了附件、没打字」同样是未发送内容：点按钮会把同一条信息送两遍。
+    const attached = await react.run(() =>
+      panel({ sessionId: 's1', useInput: () => ({ draft: '   ', attachmentIds: ['a1'] }) }))
+    assert.ok(collectButtons(attached).every((b) => b.props.disabled === true),
+      '只有附件（草稿为空白）时也必须禁用')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+/** 从 createElement 树里收集所有文本节点（用于断言面板文案）。 */
+function collectText(node, out = []) {
+  if (node === null || node === undefined || node === false) return out
+  if (typeof node === 'string' || typeof node === 'number') {
+    out.push(String(node))
+    return out
+  }
+  if (Array.isArray(node)) {
+    for (const child of node) collectText(child, out)
+    return out
+  }
+  if (typeof node !== 'object') return out
+  collectText(node.children ?? [], out)
+  return out
+}
+
+test('两个按钮把用户的二选一 POST 回宿主（§6.2 的路由表）', async () => {
+  const { exportsObject } = await loadExports()
+  const { panel } = mountPanel(exportsObject)
+  const task = { hash: 'deadbeef', round: 1, status: 'awaiting-user' }
+
+  const originalFetch = globalThis.fetch
+  const calls = []
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init })
+    if (String(url).includes('/state')) return { ok: true, json: async () => ({ task }) }
+    return { ok: true, json: async () => ({ ok: true }) }
+  }
+  try {
+    const tree = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))
+    const buttons = collectButtons(tree)
+
+    buttons[0].props.onClick()
+    await settle()
+    buttons[1].props.onClick()
+    await settle()
+
+    const posts = calls.filter((call) => call.init?.method === 'POST')
+    assert.equal(posts.length, 2)
+    assert.ok(posts[0].url.endsWith('/dsh-debug-mode/resolve'))
+    assert.ok(posts[1].url.endsWith('/dsh-debug-mode/reproduce'))
+    assert.deepEqual(JSON.parse(posts[0].init.body), { hash: 'deadbeef', sessionId: 's1' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('宿主说"残留检测未生效"时，面板必须把它显示出来（绝不假装保护着）', async () => {
+  const { exportsObject } = await loadExports()
+  const { panel } = mountPanel(exportsObject)
+  const task = {
+    hash: 'deadbeef',
+    round: 1,
+    status: 'awaiting-user',
+    detector: { available: false, writeProbe: false, writeProbeError: 'EACCES' },
+  }
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
+  try {
+    const tree = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))
+    const text = collectText(tree).join('\n')
+    assert.match(text, /残留检测未生效/)
+    assert.match(text, /EACCES/)
+
+    // 反例：检测可用时不该出现这条告警（否则用户会习惯性忽略它）。
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ task: { ...task, detector: { available: true, writeProbe: true } } }),
+    })
+    const healthy = await react.run(() => panel({
+      sessionId: 's1',
+      useInput: () => ({ draft: '' }),
+    }))
+    assert.ok(!/残留检测未生效/.test(collectText(healthy).join('\n')))
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('awaiting-agent 时按用户的选择显示收尾态（§9.4 的三种收尾状态之一）', async () => {
+  const { exportsObject } = await loadExports()
+  const { panel } = mountPanel(exportsObject)
+
+  const originalFetch = globalThis.fetch
+  try {
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'resolved' } }),
+    })
+    const resolved = await react.run(() => panel({ sessionId: 's1' }))
+    assert.match(collectText(resolved).join('\n'), /清理探针/)
+    assert.equal(collectButtons(resolved).length, 0, 'awaiting-agent 时不该再给按钮（防连点）')
+
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'reproduced' } }),
+    })
+    const reproduced = await react.run(() => panel({ sessionId: 's1' }))
+    assert.match(collectText(reproduced).join('\n'), /下一轮/)
   } finally {
     globalThis.fetch = originalFetch
   }

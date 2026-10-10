@@ -18,6 +18,9 @@
  *   · 同步追加写：崩溃前最后几条日志必须已经落盘（异步队列会吞掉现场）。
  *   · 不持有 fd：每次调用 open→write→close，保证宿主删文件后不复活它。
  *   · 单行长度上限 8 KiB，超长截断并标注 `truncated`。
+ *   · 单任务日志总量上限 16 MiB（DESIGN.md §11.2）：到顶后**停止追加**并只写一条
+ *     `probe: "debug-mode:overflow"`。为什么要停：一个跑飞的循环能在几分钟内把
+ *     磁盘写满，而那种日志读起来也没有任何信息量——停写比写满更有用。
  */
 
 // ── 由宿主在生成时替换（保持本行格式，替换脚本按前缀匹配）────────────────────
@@ -31,9 +34,14 @@ import { dirname } from 'node:path'
 /** 单条记录的字段顺序，必须与 lib/protocol.js 的 RECORD_FIELDS 一致。 */
 const FIELDS = ['ts', 'task', 'probe', 'level', 'msg', 'data']
 const MAX_LINE = 8 * 1024
+/** 单任务日志总字节上限，与 DESIGN.md §11.2 的表格一致。 */
+const MAX_BYTES = 16 * 1024 * 1024
 
 let ready = false
 let writes = 0
+/** 最近一次观测到的日志字节数（只用于 stats()，写端判据一律现算）。 */
+let bytes = 0
+let overflowed = false
 
 function ensureDir() {
   if (ready) return true
@@ -78,6 +86,32 @@ function stamp() {
 }
 
 /**
+ * 当前日志字节数。
+ *
+ * **每次都 stat，不用缓存**：宿主在 `dsh_debug_continue` 里会把日志 truncate 成 0，
+ * 而探针进程可能一直活着——缓存了尺寸的话，清空之后它会以为日志还是满的，
+ * 于是再也不写。一次 stat 换"清空一定生效"，这笔账很划算。
+ */
+function currentBytes() {
+  try {
+    bytes = statSync(LOG).size
+  } catch {
+    bytes = 0
+  }
+  return bytes
+}
+
+/** 按 FIELDS 顺序拼一行 —— 与 `probe()` 用同一段代码，保证字段序不会在两处漂移。 */
+function serialize(record) {
+  let line = ''
+  for (const field of FIELDS) {
+    if (record[field] === undefined) continue
+    line += `${line ? ',' : '{'}${JSON.stringify(field)}:${JSON.stringify(record[field])}`
+  }
+  return `${line}}\n`
+}
+
+/**
  * 写一条探针记录。
  * @param {string} probe  探针标识，推荐 `<相对文件路径>:<行号>:<短标签>`
  * @param {unknown} [data] 负载；建议传对象而不是裸字符串
@@ -86,6 +120,22 @@ function stamp() {
 export function probe(probe, data, options = {}) {
   try {
     if (!ensureDir()) return
+    // 到顶就停手：先写一条 overflow 说明，之后一律不写（连 overflow 也只写一次）。
+    if (currentBytes() >= MAX_BYTES) {
+      if (!overflowed) {
+        overflowed = true
+        const notice = serialize({
+          ts: stamp(),
+          task: TASK,
+          probe: 'debug-mode:overflow',
+          level: 'warn',
+          msg: `日志已达 ${MAX_BYTES} 字节上限，探针停止写入；请收窄埋点或开新一轮`,
+        })
+        appendFileSync(LOG, notice)
+        currentBytes()
+      }
+      return
+    }
     const record = {
       ts: stamp(),
       task: TASK,
@@ -94,16 +144,12 @@ export function probe(probe, data, options = {}) {
     }
     if (options.msg) record.msg = String(options.msg)
     if (data !== undefined) record.data = safe(data)
-    let line = ''
-    for (const field of FIELDS) {
-      if (record[field] === undefined) continue
-      line += `${line ? ',' : '{'}${JSON.stringify(field)}:${JSON.stringify(record[field])}`
-    }
-    line += '}\n'
+    let line = serialize(record)
     if (line.length > MAX_LINE) {
       line = `${line.slice(0, MAX_LINE - 32)}…","truncated":true}\n`
     }
     appendFileSync(LOG, line)
+    currentBytes()
     writes += 1
   } catch {
     // 安静降级：探针不许影响被调试程序。
