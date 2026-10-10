@@ -164,6 +164,52 @@ test('R4 L1 闸门：第 1 轮出现 dsh-debug:change 被拒；连续 3 次后�
   }
 })
 
+test('S2：面板要的两样东西——一句简短回复 + 复现步骤清单（缺了要有兜底）', async () => {
+  const { service, workspace } = await setup()
+  try {
+    const started = await startTask(service, workspace)
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '一大段分析：我先怀疑缓存分支，又看了 total 的计算，最后发现……',
+      headline: 'total 在 items 为空时算成了 null',
+      reproSteps: ['打开保存对话框', '清空标题后点保存', '回到列表页'],
+    })
+
+    const state = await service.panelState(SESSION)
+    assert.equal(state.task.headline, 'total 在 items 为空时算成了 null')
+    assert.deepEqual(state.task.reproSteps, ['打开保存对话框', '清空标题后点保存', '回到列表页'])
+
+    // 没给 headline ⇒ 拿 analysis 的第一行兜底（面板是给用户看的，空一块比说半句更糟）。
+    await service.reproduce({ hash: started.hash, sessionId: SESSION })
+    await service.continueDebug({ sessionId: SESSION, workspace: workspace.root, nextPlan: 'x' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '- 缓存分支先命中了\n后面还有一大段不该出现在面板上的东西',
+    })
+    const fallback = await service.panelState(SESSION)
+    assert.equal(fallback.task.headline, '缓存分支先命中了', '必须剥掉 Markdown 列表符号')
+    assert.deepEqual(fallback.task.reproSteps, [], '没给步骤就是空数组，面板另有兜底文案')
+
+    // 步骤会被规范化：去换行、超长截断、条数封顶——面板是卡片，不是文档。
+    await service.reproduce({ hash: started.hash, sessionId: SESSION })
+    await service.continueDebug({ sessionId: SESSION, workspace: workspace.root, nextPlan: 'y' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: 'x',
+      reproSteps: ['  第一步\n换行了  ', '', 'x'.repeat(500), ...Array.from({ length: 20 }, (_, i) => `步骤 ${i}`)],
+    })
+    const normalized = (await service.panelState(SESSION)).task.reproSteps
+    assert.equal(normalized[0], '第一步 换行了', '步骤里的换行要拍平（一条一句）')
+    assert.ok(normalized[1].length <= 200, '超长步骤必须截断')
+    assert.equal(normalized.length, 12, '条数封顶：面板不该被撑成一面墙')
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
 test('S6 不清空日志：用户点「复现」之后，现场必须原样留着等 Agent 来读', async () => {
   const { service, workspace } = await setup()
   try {

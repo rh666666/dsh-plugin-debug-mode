@@ -1,6 +1,6 @@
 # dsh-plugin-debug-mode · 设计文档
 
-> 状态：**设计冻结稿（v0.10）**。本文只描述设计与契约，不描述实现进度；
+> 状态：**设计冻结稿（v0.11）**。本文只描述设计与契约，不描述实现进度；
 > 实现进度见 §14 路线图与 §15 待验证清单；防堆屎山的机制见 §16。
 > 任何与本文件冲突的实现，一律以本文件为准，或先改本文件再改代码。
 
@@ -410,13 +410,17 @@ ctx.tools.register({
 #### S2 `dsh_debug_report`
 
 ```
-入参：{ analysis: string, probeFiles?: string[], changedFiles?: string[],
-       probes?: { probe: string, why: string }[] }
+入参：{ analysis: string, headline?: string, reproSteps?: string[],
+       probeFiles?: string[], changedFiles?: string[], probes?: {probe,why}[],
+       undoHint?: {path,find,replace}[] }
 返回：状态行（已记录，等待用户复现）+ 一句提示：可以在输入框直接描述现象，
-      面板在输入框下方
-副作用：记录 analysis 到任务状态；面板据此显示「Agent 的分析结论」；
-        status: active → awaiting-user
+      面板就在输入框上方
+副作用：记录 analysis / headline / reproSteps 到任务状态；面板据此渲染
+        「一句简短的回复 + 复现步骤清单」（§9.2）；status: active → awaiting-user
 说明：这是 Agent 的**交卷动作**。调用它 = 「我这轮埋完了，请用户复现」。
+     `headline` 与 `reproSteps` 是**给用户看的**两样东西（§9.2.1）：
+     前者是一句话结论，后者是"照着做就能复现"的步骤清单；
+     缺省时有兜底，但兜底只是不让人看到空白，不能替代 Agent 说清楚。
      `changedFiles` 与 `probeFiles` 分开记（§3.8）：前者收尾时**不得**回滚。
 ```
 
@@ -804,37 +808,62 @@ lib/client.js   ← 必须是 window.__ModuleLoader__.load({ id:'dsh-plugin-debu
 
 #### 9.1.3 面板座位（已核实）
 
-定稿座位：**`conversation.composer.dock`**（`list`，**session 作用域**，
-渲染在输入框卡片**正下方**）。
+定稿座位：**`conversation.input.dock`**（`list`，**session 作用域**，
+渲染在输入框卡片**正上方**）。
 
-**为什么不是 turnTail（推翻了 v0.4 的选择）**：这个岗位的 props 里有
-`useInput(selector)` 与 `inputActions`——**面板因此能看见用户正在输入什么**。
-而 turnTail 没有这个能力，会导致一个没法优雅解决的竞态（见 §9.3.1）：
-用户在输入框里打了半句话、又顺手点了「问题复现」，于是同一条现象描述被送了两遍。
+**为什么是"上方"（推翻了 v0.9 及以前的 `conversation.composer.dock`）**：
+`composer.dock` 渲染在输入框卡片**下方**，于是这张卡片会把输入框整体往上挤——
+用户的原话是「**挤兑了原有的提示词输入框的位置**」。这不是审美问题：
+输入框是会话里唯一一直在用的东西，任何常驻面板都不该动它的位置。
+
+首方在 `composerStack` 里的渲染顺序把这件事说得很清楚（`ui-conversation` 的产物）：
+
+```js
+const composerBar = div({ className: composerStack }, [
+  hero && HeroShell,
+  hero && heroWorkspaceRow,
+  zone !== void 0 && renderSlot("conversation.input.dock", zone),   // ← 本插件在这里
+  inputBar,                                                        // ← 输入框卡片
+])
+```
+
+`input.dock` 是**文档流里的兄弟节点**、紧挨在 `inputBar` 之前，所以：
+
+- 它**贴近**输入框（视线与手本来就在输入区，不需要去别处找）；
+- 它**不可能遮挡**输入框（不是 overlay；`conversation.input.overlay` 才是"浮在卡片里"，
+  那个座位**绝对不能用**）；
+- 它**不会挪动**输入框的位置（它在上面，把上面撑开，而不是把下面顶起来）。
+
+**为什么不是 turnTail（v0.4 被推翻的选择）**：这个岗位的 props 里有
+`useInput(selector)`——**面板因此能看见用户正在输入什么**。turnTail 没有这个能力，
+会导致一个没法优雅解决的竞态（见 §9.3.1）：用户在输入框里打了半句话、又顺手点了
+「问题复现」，于是同一条现象描述被送了两遍。
 
 已核实的座位字段（`Slots.listSubTree` 的 catalog）：
 
 ```
-conversation.composer.dock   kind: list   scope: session
-purpose: "Ambient entries below the composer card."
+conversation.input.dock   kind: list   scope: session
+purpose: "Full-width entries above the composer card."
 registration: { id (必填), order?, label? }
-ownerProps: []   ← 没有专属 props
+ownerProps: InputZone { session: SessionSnapshot; input: InputState }   ← 直接给到 InputState
 standardProps: useResource / useWorkspaces / usePanelInfo / useSessions / useSessionStatus /
                useSessionRetainInfo / useChat / useConversation / useInput / inputActions /
                useSession / sessionId / useProjection / useTrajectory
-declaredBy: an entry in "conversation.composer.bar"
+declaredBy: factory "conversation.content" (mf)
+现占用者: todo(order 0) · goal(order 10) · queue(order 20)
 ```
 
-- `sessionId` 直接给到（不需要再从别处推），`useSession(selector)` 订阅会话状态切片，
-  `useInput(selector)` 读输入框状态与草稿。
-- 渲染位置在输入框下方：用户复现完，视线与手本来就在输入区，**不需要去别处找面板**。
-
-注册形状：
+- `sessionId` 直接给到（不需要再从别处推）；`useInput(selector)` 读输入框状态与草稿；
+  ownerProps 里的 `input` 是同一份 `InputState` 的快照，作为**兜底**（旧宿主没有
+  `useInput` 时仍然能判断草稿）。
+- 取 `order: 30`：排在那三个占用者之后 = **紧贴输入框的那一格**——需要用户动手的东西
+  应该离手最近。
+- 注册形状：
 
 ```js
-ctx.slots.inject('conversation.composer.dock', () =>
+ctx.slots.inject('conversation.input.dock', () =>
   ctx.slots.register(
-    { name: 'conversation.composer.dock', id: 'debug-mode-decision', order: 100, label: () => '调试模式' },
+    { name: 'conversation.input.dock', id: 'debug-mode-decision', order: 30, label: () => '调试模式' },
     (props) => React.createElement(DebugDecisionPanel, props),
   ),
 )
@@ -845,41 +874,99 @@ ctx.slots.inject('conversation.composer.dock', () =>
   `register` 返回 disposer；`inject` 的回调本身可以返回 disposer（就是它的 effect）。
 - 这个座位只注册一次却服务**所有会话**，所以必须按 `sessionId` 自过滤、
   与本会话无关时 `return null`；**绝不要**在模块级放「当前任务」这类全局状态。
-- `conversation.composer.dock` 已被首方占用一个 cell（`mf` / `stats` / order 0）；
-  用**自己的 id**（`debug-mode-decision`）就是旁加一格，不会覆盖别人的。
+- 用**自己的 id**（`debug-mode-decision`）就是旁加一格，不会覆盖别人的 cell。
 
-### 9.1.4 面板样式
+#### 9.1.3.1 折叠（面板不许常驻占地）
+
+卡片**默认收起**，只在"轮到用户"时自动展开。规则：
+
+| 任务状态 | 默认 | 理由 |
+| --- | --- | --- |
+| `awaiting-user` | **展开** | 这是唯一需要用户动手的时刻，藏起来等于让他找不到 |
+| `active` / `awaiting-agent` | **收起** | 只剩一行状态；Agent 在干活时它不该占着输入框上方 |
+
+- 头部整行是一个 `<button>`（键盘可达、`aria-expanded` 正确），点它手动折叠/展开。
+- 手动选择**只对当时那个状态有效**：状态一变就回到默认策略（否则用户折过一次之后，
+  下一次轮到他复现时卡片会一直藏着）。
+- 折叠态的那一行必须**自己说清楚现在轮到谁**（"轮到你复现并选择" / "已通知 Agent 读日志"
+  / "Agent 正在埋点/排查"）——收起不等于信息量为零，用户很可能就靠这一行决定要不要展开。
+- `awaiting-user` 时卡片左侧加一道品牌色边：折成一个色条也仍然"在说话"。
+
+#### 9.1.4 面板样式
 
 用 `--dsw-alias-*` 主题令牌，**必须带 fallback**（如
 `var(--dsw-alias-label-secondary, #6b7280)`），并且**不要**为实现浅/深色各写一份
-覆盖块——alias 令牌本身就是按主题解析的（只有像壁纸插件那样强行改表面色时才需要
-显式覆盖块）。常用令牌：`--dsw-alias-bg-layer-1/-2`、`--dsw-alias-border-l1/-l2`、
-`--dsw-alias-label-primary/-secondary/-tertiary`、`--dsw-alias-button-primary-fill`、
-`--dsw-alias-interactive-bg-hover`。
+覆盖块——alias 令牌本身就是按主题解析的。
 
-> 注意：这批令牌名来自一个已发布第三方插件的真实样式表，**不是**从 Theme provider
-> 读到的（client inspect provider 当前超时）。首次实现时再核对一次。
+**令牌来源（v0.10 起已核实，不再是猜的）**：`client/Theme` inspect provider 的
+`listTokens` 给出的权威清单是——`--dsw-alias-bg-base` / `-bg-layer-1` / `-bg-layer-2` /
+`-bg-overlay` / `-border-l1` / `-border-l2` / `-brand-primary` / `-label-primary` /
+`-label-secondary` / `-state-error-primary` / `-state-idle-primary` /
+`-state-success-primary` / `-state-warn-primary` / `--dsw-specific-sidebar-fill`。
+本插件只用了这一批里的名字。首方样式表里还实际出现过 `--dsw-radius-lg`、
+`--dsw-elevation-panel`、`--dsh-composer-card-max-width` 等**非别名**令牌，
+面板用它们做圆角/阴影/与输入框对齐，**每一个都带 fallback**——
+名字万一变了，最坏结果是回到朴素外观，而不是整块面板变透明或不可读。
+
+**不做"主按钮"**：「问题已解决」与「问题复现」是一个二选一，把其中一个做成填充色
+等于替用户表态。两个按钮同权重（描边样式），强调留给清单与标题句。
 
 ### 9.1.5 面板位置与归属
 
-- **面板常驻**于输入框下方，从任务创建到任务结束都在（这样你在调试期间随时看得到
-  当前轮次与日志量）。只是**可交互性随状态变化**：
-  `active` / `awaiting-agent` 时只显示状态（按钮禁用），`awaiting-user` 时才开放选择。
+- **面板常驻于输入框上方**（不折叠时占一行头 + 正文，折叠时只占一行），
+  从任务创建到任务结束都在——调试期间随时看得到当前轮次与日志量。
+  可交互性与展开状态随状态变化（§9.1.3.1）。
 - 归属：按 **`sessionId` + hash** 判定，不允许出现「A 会话的调试面板在 B 会话里弹出」。
 
-### 9.2 内容
+### 9.2 内容：**一句回复 + 一份清单**（v0.11 重做）
+
+面板只说两件事，而且顺序固定：**结论一句话**，然后**用户要做什么**。
+
+展开态：
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│ 调试模式 · 任务 deadbeef · 第 2 轮               312 行日志     │
+│ ▾ 调试模式 · #deadbeef · 第 2 轮 · 轮到你复现并选择   312 行 48KB │  ← 整行可点，折叠/展开
 │                                                                │
-│ Agent 的分析结论：                                              │
-│   total 在 items 为空时算成了 null，导致列表分支没命中…          │
+│ total 在 items 为空时算成了 null                                 │  ← ① 一句简短的回复
 │                                                                │
-│ 复现后：可以直接在输入框描述现象，也可以在这里做个结论 →          │
+│ 请按这个顺序复现：                                              │
+│   1. 打开保存对话框                                             │  ← ② 用户要操作的步骤清单
+│   2. 清空标题后点保存                                            │     （Agent 给的 reproSteps）
+│   3. 回到列表页                                                 │
+│                                                                │
+│ 也可以不用按钮：直接在输入框里描述现象，同样算「还在」。          │
 │   [ 问题已解决 ]   [ 问题复现，需要进一步修复 ]                  │
 └────────────────────────────────────────────────────────────────┘
 ```
+
+折叠态（**默认**，除 `awaiting-user` 外）：
+
+```
+│ ▸ 调试模式 · #deadbeef · 第 2 轮 · Agent 正在埋点/排查   312 行 48KB │
+```
+
+两条硬要求：
+
+1. **短**。面板读的是 `task.headline`，不是 `task.lastReport`——整篇分析永远不进面板
+   （旧版把 `lastReport` 塞进去，长到要把卡片撑成半屏，那正是"内容也需要修改"的来源）。
+   步骤区另有 `max-height` + 滚动：清单再长也不许把输入框顶出视野。
+2. **可照做**。清单项是**一条一个可执行动作**（"清空标题后点保存"），不是
+   "请复现一下"这种愿望。这两样东西只有 Agent 能提供，所以它们是
+   `dsh_debug_report` 的入参（§6.2 S2）；缺了有兜底（标题句取 `analysis` 第一行、
+   步骤为空时给一句"请再复现一次"），但兜底只是不让人看到空白，不能替代 Agent 说清楚。
+
+### 9.2.1 面板数据的来源（为什么必须加这两个入参）
+
+| 面板上的东西 | 来源 | 缺省时 |
+| --- | --- | --- |
+| 一句简短的回复 | `dsh_debug_report` 的 `headline` | 取 `analysis` 第一行（剥掉 Markdown 标记、截断 80 字） |
+| 复现步骤清单 | `dsh_debug_report` 的 `reproSteps` | 空数组 → 面板显示"请按你印象里的操作再复现一次" |
+| 轮次 / 状态 / 日志量 | 宿主自己（`state.json` + `stat`） | —— |
+
+"复现步骤"这件事**过去没人负责**：任务只记了用户的原始描述（`goal`），那是现象，
+不是步骤；用户面对"请复现"只能凭记忆猜一遍当初怎么触发的。而 Agent 恰恰是唯一
+知道"这次该按什么顺序操作才能命中那段代码"的角色——所以它必须说出来。
 
 ### 9.3 交互（**三条输入路径**）
 
@@ -899,7 +986,8 @@ ctx.slots.inject('conversation.composer.dock', () =>
 真实场景：用户在输入框打了「只在切换标签页后复现」，然后**顺手点了**「问题复现」。
 如果不处理，同一个信息会被送两遍（一次作为用户消息、一次作为按钮信号）。
 
-处理方式（这是把面板放在 `composer.dock` 的全部理由）：
+处理方式（这是必须选一个**给到 `useInput`** 的座位的全部理由——`input.dock` 与
+被它取代的 `composer.dock` 都有这个能力，`turnTail` 没有）：
 
 - 面板用 `useInput` 读**当前草稿**；**草稿非空时两个按钮禁用**，并给出一行提示：
   「输入框里有未发送的内容 —— 直接发送即可，它会被当成『问题复现』继续排查」。
@@ -1034,7 +1122,8 @@ ctx.slots.inject('conversation.composer.dock', () =>
 | 浏览器↔宿主走 `webServer` 路由 + fetch + 轮询 | **已核实**（§6.2；`host.call` 不存在，已作废） |
 | 唤醒 Agent 用 `sessionController.prompt` | 已核实签名；`PromptContentPart` / `SessionRequestId` 待验证 |
 | 探针桩默认生命周期与任务目录同生共死 | **冻结**（§7.1、§7.4） |
-| 面板的具体 Slot | **已核实**：`conversation.composer.dock`（§9.1.3） |
+| **面板的具体 Slot** | **已核实**：`conversation.input.dock`（输入框卡片**正上方**、文档流内、不可能遮挡输入框；§9.1.3） |
+| **面板折叠策略与内容形状** | **冻结**（§9.1.3.1 / §9.2：默认折叠、只在 `awaiting-user` 自动展开；内容 = 一句 `headline` + `reproSteps` 编号清单） |
 | 客户端半是手写 ESM 还是必须打包 | **已核实**：必须打包成 `__ModuleLoader__` 产物（§9.1） |
 | 客户端构建链 | **已定稿**：`scripts/build-client.mjs` 单文件包装，零第三方依赖 |
 | **用户侧入口只有 `/debug`，且由宿主票据硬校验** | **冻结**（§3） |
@@ -1083,7 +1172,7 @@ ctx.slots.inject('conversation.composer.dock', () =>
 > 每一项后面——**这是执行纪律的一部分：结论要能被人复核**。
 
 1. ~~**`TurnLocation` 的字段形状**~~ → **不再需要**。面板改用 `sessionId` + 轮询，
-   不再用 turn 坐标寻址（`conversation.composer.dock` 直接给 `sessionId`）。
+   不再用 turn 坐标寻址（`conversation.input.dock` 直接给 `sessionId`）。
 2. **沙箱**：已落地为**运行期自检**而不是静态结论——`start` 前写
    `.dsh/debug-mode/.probe-write-test`，失败即拒绝启动任务、并在面板常驻
    「残留检测未生效」。这比"查一次文档"更可靠：它反映的是**这台机器此刻**的事实。
@@ -1333,4 +1422,5 @@ debugging, testing, and verification》、Sedano 等的《Software Development W
 | 0.8 | 2026-10-10 | **M1–M6 全部落地**（实现期变更，逐条都有测试钉住）：① §15 的 10 项待验证里 9 项闭合，核实依据写回该节；② **R4 L1 的闸门判据收窄**为「出现 `dsh-debug:change` 或自报 `changedFiles`」——原措辞"文件被改过就拒绝"会把埋探针本身判成违规，是这个插件自己给自己制造的死锁（§16.3.0 要防的正是这个）；③ **R1 基线语义修正**：`report` 只量不推进基线，否则第二次交卷看到的 diff 永远是空的，R1 会退化成"Agent 自报"；④ 状态机新增 `awaiting-user → active`（§9.3.2 的宿主自动迁移，见 §6.3）；⑤ 路由表新增 `GET /board`（R5 跨任务欠账看板）；⑥ 探针桩新增 **16 MiB 总量上限**（§11.2）与 `debug-mode:overflow` 说明行，且尺寸**每次 stat 不缓存**——否则宿主清空日志后探针会以为还满着而永久停写；⑦ 隔离区按**文件**归并（同一文件的多个症状让用户回答一次）；⑧ `dsh_debug_end` 新增 `quarantine` 参数作为三选一的回填通道，`summary` 写进返回值与 journal；⑨ 工具返回值统一为 `{ok,text,…}` 并由 `output.render` 投影，错误路径与成功路径共用同一 schema（避免 `ToolOutputError` 把最需要被读到的错误吞掉）；⑩ 新增 `lib/scan.js`·`lib/summary.js`·`lib/prompt.js`·`lib/debug-service.js`·`lib/command.js`·`lib/tools.js`·`lib/routes.js` 与 5 个测试文件（69 个断言全绿）；⑪ 面板接上真交互与收尾三态，`InputState` 字段写死为实测值 |
 | 0.9 | 2026-02-19 | **按一次真实事故（`D:\` 缺 WRITE_DAC ⇒ 所有 shell 命令被拒）收口「不需要任何命令」**：① 新增 **§3.10「Agent 不运行任何命令」**，把"发信号 + 埋点/改代码"写死为 Agent 的全部动作，复现归用户；② 新增 **§7.6 HTTP 探针通道**与 `assets/probe.browser.js`——宿主开一条 `POST /probe?h=<hash>` 的只追加写端点（CORS 简单请求、NDJSON、`task` 由宿主写死、限额与桩同一套），浏览器页面因此**不需要起本地服务器**（那要跑命令）就能埋点；③ `dsh_debug_start` 现在生成第二个桩并返回端点，宿主地址取自 `DSH_WEB_URL`，拿不到时**不生成也不猜端口**；④ 注入准则、`/debug` 指令正文、`assets/AGENT-PROBE-GUIDE.md`（新增 §零）三处都明确写出"不要运行任何命令"，并明说 shell 被环境挡掉不影响本流程；⑤ §1.3 非目标里"怎么跑起来由 Agent 决定"这句被本事故证伪，改为指向 §3.10；⑥ §10 存储表补齐 `index.json` / `backups/` / `journal.jsonl` / 浏览器桩 / 票据；⑦ 新增 `test/ingest.test.mjs`（8 条：协议一致、`task` 不可伪造、只认活跃任务、限额、CORS/预检、浏览器桩在 vm 里真的发出记录、端点未知时的行为） |
 | 0.10 | 2026-02-19 | **修掉一个"用户一点「复现」，证据就没了"的致命错误**：① **S6 不再清空日志**（§6.1 的信号表从「清空」改为「保留」）——S6 发生在 Agent **还没读**的时候，清空等于把用户刚复现出来的现场当场扔掉，随后宿主还发一条指令让 Agent 去 `dsh_debug_read`（§6.2 原文自己就写着"本轮日志已清空…请按信号序列执行 dsh_debug_read"，前后矛盾）；② **清空的唯一时机收敛到 S3**，也就是"Agent 已读过现场、正要开始新一轮埋点"= **下一次用户复现之前**；③ 新增**闸门 C**：`当前日志字节数 > task.lastRead.bytes` 时拒绝清空并要求先读（三振降级）；`continue` 之后 `lastRead` 归零，否则闸门 C 会永久失效；④ **`gate()` 的签名改为 `gate(key, reason, detail)`**：`reason` 作为"同一原因"的比较键必须稳定，数字与清单挪到 `detail`——原先把 `检测到 N 个文件` 拼进 reason，会让每次比较都不相等、计数器永远归零，**所有闸门的降级机制其实都不会触发**（这是本次顺带发现的隐蔽死锁）；⑤ 三处顺序写反的文案一并改掉：`assets/AGENT-PROBE-GUIDE.md` 的「`continue`（清空）→ 读日志」、DESIGN §6.2 S6 的指令正文、`dsh_debug_continue` 的工具描述；⑥ 面板 `awaiting-agent` 文案从「本轮日志已清空」改为「日志保留着，等它读完再开下一轮」；⑦ 新增/改写测试：S6 之后日志必须还在、`continue` 之前必须有 `read`、闸门 C 三振后放行 |
+| 0.11 | 2026-02-19 | **面板重做：从"挤在输入框下面"改成"贴在输入框上面的一张可折叠卡片"**（用户反馈"挤兑了原有的提示词输入框的位置"）：① 座位从 `conversation.composer.dock`（渲染在卡片**下方**）改为 **`conversation.input.dock`**（首方在 `composerStack` 里把它渲染在 `inputBar` **之前**，是文档流兄弟节点 ⇒ 贴近输入框、**不可能遮挡**、也**不会挪动**输入框），`order: 30` 排在 todo/goal/queue 之后紧贴输入框；② 新增**折叠**（§9.1.3.1）：默认收起，只在 `awaiting-user` 自动展开；头部整行是 `<button>`（含 `aria-expanded`），手动折叠只对当时那个状态有效；折叠态的**那一行必须自己说清轮到谁**；③ 面板内容重做为「**一句简短的回复 + 需要用户操作的复现步骤清单**」（§9.2）：`dsh_debug_report` 新增可选入参 `headline` 与 `reproSteps`（§9.2.1）——"复现步骤"过去没人负责（任务只记了 `goal` 这个**现象**，用户面对"请复现"只能凭记忆猜），现在由唯一知道该按什么顺序操作命中的角色（Agent）说出来；漏给时标题句取 `analysis` 第一行、步骤为空时给一句提示，但兜底只保证"不空白"；④ 面板不再渲染整篇 `lastReport`（长到把卡片撑成半屏），步骤区限高 + 滚动，面板再长也不许把输入框顶出视野；⑤ 样式令牌换用 `client/Theme` provider 的权威清单（§9.1.4），非别名令牌（圆角/阴影/对齐）一律带 fallback；⑥ 去掉填充色"主按钮"——「已解决 / 复现」是二选一，把其中一个做成主按钮等于替用户表态；⑦ 测试：座位断言钉死为 `conversation.input.dock`、折叠两个方向都测、内容必须是 `ol/li` 清单且不得包含整篇分析、`headline`/`reproSteps` 的兜底与规范化（去换行、截断、封顶 12 条） |
 

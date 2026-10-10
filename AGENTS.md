@@ -85,15 +85,15 @@
 
 ## 2. 当前状态
 
-**M0 – M6 + §16 的 R1–R6 全部落地，HTTP 探针通道（§7.6）已补齐：77 个测试全绿。**
-剩下的一件事是**人在真实 GUI 里点一次面板**（M4 的验收判据）——代码路径已被产物测试
-覆盖，但那一步只能由人做。
+**M0 – M6 + §16 的 R1–R6 + HTTP 探针通道全部落地，面板已重做为「输入框上方的可折叠卡片」：
+82 个测试全绿。** 剩下的一件事是**人在真实 GUI 里点一次面板**（M4 的验收判据）——
+代码路径已被产物测试覆盖，但那一步只能由人做。
 
 已落地：
 
 | 文件 | 内容 |
 | --- | --- |
-| [DESIGN.md](./DESIGN.md) | 设计冻结稿（v0.9）：入口/信号协议、代码改动纪律、日志协议、**HTTP 探针通道（§7.6）**、状态机、面板、**防堆屎山机制（§16）**、路线图、待验证清单 |
+| [DESIGN.md](./DESIGN.md) | 设计冻结稿（v0.11）：入口/信号协议、代码改动纪律、日志协议、**HTTP 探针通道（§7.6）**、状态机、**面板座位与折叠（§9.1.3/§9.1.3.1）、面板内容（§9.2）**、**防堆屎山机制（§16）**、路线图、待验证清单 |
 | [package.json](./package.json) | 包清单：`dsh.bundle.patch` + `dsh.client` 双挂载声明 |
 | [cordis.patch.yml](./cordis.patch.yml) | bundle 挂载声明（插入 `debug-mode` 行） |
 | [lib/protocol.js](./lib/protocol.js) | 日志行协议的唯一真相：`formatRecord` / `parseRecord` / `parseLog` |
@@ -110,10 +110,10 @@
 | [assets/probe.template.mjs](./assets/probe.template.mjs) | 零依赖 Node 探针桩模板（烘死 TASK/LOG；16 MiB 上限） |
 | [assets/probe.browser.js](./assets/probe.browser.js) | 零依赖**浏览器**探针桩模板（经典脚本，`dshProbe` → HTTP 摄入；批量 + 卸载冲刷） |
 | [assets/AGENT-PROBE-GUIDE.md](./assets/AGENT-PROBE-GUIDE.md) | 回给 Agent 的埋点指南模板（含 `{{HASH}}` 等变量；§零「不要运行任何命令」、§五 HTTP 通道） |
-| [src/client.js](./src/client.js) | 浏览器半**源码**：composer dock 座位 + 三态面板 + 按钮接线 + 草稿协调 + 样式令牌 |
+| [src/client.js](./src/client.js) | 浏览器半**源码**：输入框上方的可折叠卡片 + 三态渲染 + 按钮接线 + 草稿协调 + 样式令牌 |
 | [scripts/build-client.mjs](./scripts/build-client.mjs) | 把源码包成 `__ModuleLoader__` 产物（零第三方依赖） |
 | [lib/client.js](./lib/client.js) | 【生成物】客户端产物，勿手改 |
-| `test/*.test.mjs` + [test/helpers.mjs](./test/helpers.mjs) | 77 个守卫测试，全绿（协议/扫描/摘要/服务端到端/工具契约/装配/**HTTP 摄入**/客户端产物） |
+| `test/*.test.mjs` + [test/helpers.mjs](./test/helpers.mjs) | 82 个守卫测试，全绿（协议/扫描/摘要/服务端到端/工具契约/装配/**HTTP 摄入**/客户端产物与面板） |
 
 **仍未落地（明确记录，不假装完成）**：`ctx.remote.$on` 推送（第一版一律轮询，这是取舍
 不是未知）、面板的真浏览器人工验收、其它语言的探针桩（由 Agent 按协议自写，或直接用
@@ -311,11 +311,22 @@ DSH 有两条互不相通的客户端通道，API 名一样、能力完全不同
   `SECTION_ORDERS`（本插件用 `TOOLS_SDK=5000` 之后的 **5050**）。
 - 客户端入口是 `exports["./client"].default`（不是 `main`），且产物**必须**是
   `window.__ModuleLoader__.load({ id, factory })` 脚本——宿主不做编译（§4.3）。
-- 面板座位是 **`conversation.composer.dock`**（list / session 作用域，输入框正下方），
-  用 `ctx.slots.inject`（声明感知）注册。它给到 `useInput`，面板因此能看见用户正在打
-  什么，从而避免「打了半句又顺手点按钮 ⇒ 同一条描述送两遍」的竞态（DESIGN.md §9.3.1）。
+- 面板座位是 **`conversation.input.dock`**（list / session 作用域，**输入框卡片正上方**），
+  用 `ctx.slots.inject`（声明感知）注册。**不要**用 `conversation.composer.dock`：
+  那个渲染在卡片**下方**，会把输入框往上挤（实测反馈原话是「挤兑了原有的提示词输入框的位置」）。
+  首方在 `composerStack` 里把 `input.dock` 渲染在 `inputBar` **之前**，所以它贴近输入框、
+  不会挪动它、也**不可能遮挡**它——那是文档流兄弟节点，不是 overlay
+  （`conversation.input.overlay` 才是浮在卡片里的那个，绝对不能用）。
+  该座位给到 `useInput`，面板因此能看见用户正在打什么，从而避免
+  「打了半句又顺手点按钮 ⇒ 同一条描述送两遍」的竞态（DESIGN.md §9.3.1）。
+- 面板**默认折叠**，只在 `awaiting-user` 自动展开；折叠态的那一行必须自己说清"轮到谁"
+  （§9.1.3.1）。这是"不占输入框地方"的另一半——只在上面是不够的。
+- 面板内容只有两样：`dsh_debug_report` 的 **`headline`**（一句话结论）与
+  **`reproSteps`**（让用户照着做的步骤清单）。**不要把整篇 `analysis` 塞进面板**：
+  那是给模型的分析，给用户看的只有那两句（§9.2、§9.2.1）。
 - `InputState` = `{ draft, attachmentIds, draftRev, phase, occurrences, queue }`；
-  面板只看 `draft`（字符串）与 `attachmentIds`（数组）。
+  面板只看 `draft`（字符串）与 `attachmentIds`（数组）。同座位的 ownerProps 里还有一份
+  `input` 快照，作为旧宿主的兜底。
 - 用户消息事件是 `session/event` 的 `event.type === 'user/message'`（§9.3.2 的迁移依据）。
 
 **仍未闭合**

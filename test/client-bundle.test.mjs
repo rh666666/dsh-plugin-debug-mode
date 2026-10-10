@@ -30,7 +30,7 @@ const BUILD = join(ROOT, 'scripts', 'build-client.mjs')
 const NODE = process.execPath
 
 /** 座位 key：改这里就会同时提醒改测试与 DESIGN.md §9.1.3。 */
-const SLOT_KEY = 'conversation.composer.dock'
+const SLOT_KEY = 'conversation.input.dock'
 const SLOT_ID = 'debug-mode-decision'
 
 /**
@@ -47,9 +47,11 @@ const react = {
   /**
    * @param {() => unknown} render 一次渲染调用
    * @param {number} [rounds] 允许的重渲染轮数
+   * @param {(tree: unknown) => void} [after] 每轮渲染之后、settle 之前调用——
+   *   用来模拟"用户在面板上点了一下"：它触发的 setState 会让循环再跑一轮。
    * @returns {Promise<unknown>} 最后一次渲染的宿主树
    */
-  async run(render, rounds = 3) {
+  async run(render, rounds = 3, after = null) {
     const instance = { state: [], cursor: 0, effects: [], scheduled: false }
     try {
       let value
@@ -59,6 +61,7 @@ const react = {
         instance.effects = []
         react.instance = instance
         value = resolve(render())
+        after?.(value)
         // effect 里的 fetch → then → setState 需要几个微任务才落定。
         await settle()
         for (const effect of instance.effects) effect.cleanup?.()
@@ -215,13 +218,17 @@ test('产物是一个自洽的 Module Loader 注册脚本', async () => {
   assert.ok(exportsObject.inject.includes('slots'), 'inject 必须包含 slots')
 })
 
-test('apply(ctx) 用声明感知的 inject 注册到 composer dock', async () => {
+test('apply(ctx) 用声明感知的 inject 注册到输入框**上方**的座位', async () => {
   const { exportsObject } = await loadExports()
   const { injections, options } = mountPanel(exportsObject)
 
   assert.equal(injections[0].seat, SLOT_KEY, `座位必须是 ${SLOT_KEY}（见 DESIGN.md §9.1.3）`)
   assert.equal(options.name, SLOT_KEY)
-  assert.equal(options.id, SLOT_ID, '用自己的 id 旁加一格，不覆盖首方在同一个 dock 里的 cell')
+  assert.equal(SLOT_KEY, 'conversation.input.dock',
+    '这张卡片必须在输入框**上方**：首方把 conversation.input.dock 在文档流里渲染在 inputBar 之前，'
+    + '所以它贴近输入框又不可能遮挡它；旧座位 conversation.composer.dock 渲染在卡片下方，会把输入框往上挤')
+  assert.equal(options.id, SLOT_ID, '用自己的 id 旁加一格，不覆盖别人在同一个 dock 里的 cell')
+  assert.ok(Number.isFinite(options.order), 'order 必须显式给，否则会插到别人的前面去')
   assert.equal(typeof options.label, 'function', 'label 用 thunk，切语言时无需重注册')
 })
 
@@ -243,38 +250,6 @@ test('没有会话或没有任务时渲染空（不得在每会话挂空壳）',
   }
 })
 
-test('awaiting-user 时给出两个可用按钮；有草稿时禁用（§9.3.1 竞态防护）', async () => {
-  const { exportsObject } = await loadExports()
-  const { panel } = mountPanel(exportsObject)
-  const task = { hash: 'deadbeef', round: 2, status: 'awaiting-user', lastReport: '看起来是空数组分支' }
-
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
-  try {
-    // InputState 的字段名是**实测**的（`SessionInputShell.compose()`）：`draft` + `attachmentIds`。
-    const idle = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '', attachmentIds: [] }) }))
-    const buttons = collectButtons(idle)
-    assert.equal(buttons.length, 2, 'awaiting-user 应给出两个按钮')
-    assert.deepEqual(buttons.map((b) => b.children[0]), ['问题已解决', '问题复现，需要进一步修复'])
-    assert.ok(buttons.every((b) => b.props.disabled === false), '草稿为空时两个按钮都应可用')
-
-    const typing = await react.run(() =>
-      panel({ sessionId: 's1', useInput: () => ({ draft: '只在切换标签页后复现', attachmentIds: [] }) }))
-    const typingButtons = collectButtons(typing)
-    assert.equal(typingButtons.length, 2)
-    assert.ok(typingButtons.every((b) => b.props.disabled === true),
-      '输入框有未发送内容时必须禁用两个按钮，避免同一条描述送两遍')
-
-    // 「只挂了附件、没打字」同样是未发送内容：点按钮会把同一条信息送两遍。
-    const attached = await react.run(() =>
-      panel({ sessionId: 's1', useInput: () => ({ draft: '   ', attachmentIds: ['a1'] }) }))
-    assert.ok(collectButtons(attached).every((b) => b.props.disabled === true),
-      '只有附件（草稿为空白）时也必须禁用')
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-})
-
 /** 从 createElement 树里收集所有文本节点（用于断言面板文案）。 */
 function collectText(node, out = []) {
   if (node === null || node === undefined || node === false) return out
@@ -291,6 +266,191 @@ function collectText(node, out = []) {
   return out
 }
 
+/** 按 className 取元素（头部折叠键与两个动作键都是 button，必须分得开）。 */
+function collectByClass(node, className, out = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) collectByClass(child, className, out)
+    return out
+  }
+  if (!node || typeof node !== 'object') return out
+  if (String(node.props?.className ?? '').split(/\s+/).includes(className)) out.push(node)
+  collectByClass(node.children ?? [], className, out)
+  return out
+}
+
+/** 两个「做结论」的按钮（不含头部那个折叠键）。 */
+const collectActionButtons = (node) => collectByClass(node, 'dsh-dbg-btn')
+/** 头部的折叠键。 */
+const collectHeadButton = (node) => collectByClass(node, 'dsh-dbg-head')[0]
+/** 复现步骤清单项（`li` 要在 `ol` 里找；不去猜 children 的嵌套形状）。 */
+const collectSteps = (node) => collectByType(node, 'li')
+
+/** 按元素标签取节点。 */
+function collectByType(node, type, out = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) collectByType(child, type, out)
+    return out
+  }
+  if (node === null || typeof node !== 'object') return out
+  if (node.type === type) out.push(node)
+  collectByType(node.children ?? [], type, out)
+  return out
+}
+
+test('awaiting-user 时给出两个可用按钮；有草稿时禁用（§9.3.1 竞态防护）', async () => {
+  const { exportsObject } = await loadExports()
+  const { panel } = mountPanel(exportsObject)
+  const task = {
+    hash: 'deadbeef',
+    round: 2,
+    status: 'awaiting-user',
+    headline: 'total 在 items 为空时算成了 null',
+    reproSteps: ['打开保存对话框', '清空标题后点保存', '回到列表页'],
+  }
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
+  try {
+    // InputState 的字段名是**实测**的（`SessionInputShell.compose()`）：`draft` + `attachmentIds`。
+    const idle = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '', attachmentIds: [] }) }))
+    const buttons = collectActionButtons(idle)
+    assert.equal(buttons.length, 2, 'awaiting-user 应给出两个按钮')
+    assert.deepEqual(buttons.map((b) => b.children[0]), ['问题已解决', '问题复现，需要进一步修复'])
+    assert.ok(buttons.every((b) => b.props.disabled === false), '草稿为空时两个按钮都应可用')
+
+    const typing = await react.run(() =>
+      panel({ sessionId: 's1', useInput: () => ({ draft: '只在切换标签页后复现', attachmentIds: [] }) }))
+    const typingButtons = collectActionButtons(typing)
+    assert.equal(typingButtons.length, 2)
+    assert.ok(typingButtons.every((b) => b.props.disabled === true),
+      '输入框有未发送内容时必须禁用两个按钮，避免同一条描述送两遍')
+
+    // 「只挂了附件、没打字」同样是未发送内容：点按钮会把同一条信息送两遍。
+    const attached = await react.run(() =>
+      panel({ sessionId: 's1', useInput: () => ({ draft: '   ', attachmentIds: ['a1'] }) }))
+    assert.ok(collectActionButtons(attached).every((b) => b.props.disabled === true),
+      '只有附件（草稿为空白）时也必须禁用')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('面板内容 = 一句简短回复 + 可照做的复现步骤清单', async () => {
+  const { exportsObject } = await loadExports()
+  const { panel } = mountPanel(exportsObject)
+  const task = {
+    hash: 'deadbeef',
+    round: 2,
+    status: 'awaiting-user',
+    headline: 'total 在 items 为空时算成了 null',
+    reproSteps: ['打开保存对话框', '清空标题后点保存', '回到列表页'],
+    lastReport: '很长很长的分析正文……',
+  }
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
+  try {
+    const tree = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))
+
+    // ① 一句简短的回复：就是 headline，不是整篇 analysis。
+    const texts = collectText(tree)
+    assert.ok(texts.includes('total 在 items 为空时算成了 null'), '标题句必须原样显示')
+    assert.ok(!texts.includes(task.lastReport), '不能把整篇分析倒进面板——那正是"不简短"的来源')
+
+    // ② 复现步骤做成编号清单（ol/li），用户照着做就能复现。
+    const lists = collectByClass(tree, 'dsh-dbg-steps')
+    assert.equal(lists.length, 1)
+    assert.equal(lists[0].type, 'ol', '步骤必须是编号列表，不是一段散文')
+    assert.deepEqual(collectSteps(tree).map((item) => item.children[0]), task.reproSteps)
+
+    // ③ 没有步骤时不留白：说清该做什么，而不是给个按钮让用户发呆。
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ task: { ...task, reproSteps: [] } }),
+    })
+    const noSteps = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))
+    assert.equal(collectByClass(noSteps, 'dsh-dbg-steps').length, 0)
+    assert.match(collectText(noSteps).join('\n'), /再复现一次/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('折叠：只有轮到用户时自动展开；头部可手动折叠/展开；状态一变回到默认策略', async () => {
+  const { exportsObject } = await loadExports()
+  const { panel } = mountPanel(exportsObject)
+
+  const originalFetch = globalThis.fetch
+  /** 把宿主的 /state 换成"当前任务是这一个"。 */
+  const serveTask = (task) => {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
+  }
+  const render = () => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) })
+  try {
+    // ① 轮到用户 → 自动展开（这是唯一需要他动手的时刻）。
+    serveTask({ hash: 'deadbeef', round: 1, status: 'awaiting-user', headline: '结论' })
+    const waiting = await react.run(render)
+    assert.equal(waiting.props['data-collapsed'], 'false', 'awaiting-user 必须自动展开')
+    assert.equal(collectActionButtons(waiting).length, 2)
+
+    // ② 其它状态 → 自动收起，只留一行状态；但那一行自己必须说清现在轮到谁。
+    serveTask({ hash: 'deadbeef', round: 1, status: 'active', headline: '结论' })
+    const running = await react.run(render)
+    assert.equal(running.props['data-collapsed'], 'true', '不占输入框上方的地方')
+    assert.equal(collectActionButtons(running).length, 0)
+    const runningText = collectText(running).join('\n')
+    assert.match(runningText, /Agent 正在埋点\/排查/, '折叠后仍要知道 Agent 在干嘛')
+    assert.ok(!runningText.includes('结论'), '折叠时不该渲染正文')
+
+    // ③ 头部可点：同一个实例里点一下，卡片就折起来；再点一下展开回来。
+    serveTask({ hash: 'deadbeef', round: 1, status: 'awaiting-user', headline: '结论' })
+    let folded = false
+    const collapsedTree = await react.run(render, 6, (value) => {
+      if (folded || value?.props?.['data-collapsed'] !== 'false') return
+      folded = true
+      collectHeadButton(value)?.props.onClick()
+    })
+    assert.equal(folded, true, '第一轮应该拿到了展开态')
+    assert.equal(collapsedTree.props['data-collapsed'], 'true', '点一次头部应把卡片折起来')
+    assert.equal(collectActionButtons(collapsedTree).length, 0)
+    assert.match(collectText(collapsedTree).join('\n'), /轮到你复现并选择/, '折起来也还得看得见该你动手了')
+
+    let unfolded = false
+    const expandedTree = await react.run(render, 8, (value) => {
+      // 先折起来，再展开——验证两个方向都有效。
+      if (!unfolded && value?.props?.['data-collapsed'] === 'false') {
+        collectHeadButton(value)?.props.onClick()
+        return
+      }
+      if (!unfolded && value?.props?.['data-collapsed'] === 'true') {
+        unfolded = true
+        collectHeadButton(value)?.props.onClick()
+      }
+    })
+    assert.equal(unfolded, true, '折起来之后应该能再展开')
+    assert.equal(expandedTree.props['data-collapsed'], 'false')
+    assert.equal(collectActionButtons(expandedTree).length, 2)
+
+    // ④ awaiting-agent 两种收尾态：折叠态那一行也要能区分开（§9.4）。
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'resolved' } }),
+    })
+    const resolved = await react.run(() => panel({ sessionId: 's1' }))
+    assert.match(collectText(resolved).join('\n'), /已通知 Agent 清理探针/)
+    assert.equal(collectActionButtons(resolved).length, 0, 'awaiting-agent 时不该再给按钮（防连点）')
+
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'reproduced' } }),
+    })
+    const reproduced = await react.run(() => panel({ sessionId: 's1' }))
+    assert.match(collectText(reproduced).join('\n'), /已通知 Agent 读日志/)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('两个按钮把用户的二选一 POST 回宿主（§6.2 的路由表）', async () => {
   const { exportsObject } = await loadExports()
   const { panel } = mountPanel(exportsObject)
@@ -305,7 +465,7 @@ test('两个按钮把用户的二选一 POST 回宿主（§6.2 的路由表）',
   }
   try {
     const tree = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))
-    const buttons = collectButtons(tree)
+    const buttons = collectActionButtons(tree)
 
     buttons[0].props.onClick()
     await settle()
@@ -350,31 +510,6 @@ test('宿主说"残留检测未生效"时，面板必须把它显示出来（绝
       useInput: () => ({ draft: '' }),
     }))
     assert.ok(!/残留检测未生效/.test(collectText(healthy).join('\n')))
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-})
-
-test('awaiting-agent 时按用户的选择显示收尾态（§9.4 的三种收尾状态之一）', async () => {
-  const { exportsObject } = await loadExports()
-  const { panel } = mountPanel(exportsObject)
-
-  const originalFetch = globalThis.fetch
-  try {
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'resolved' } }),
-    })
-    const resolved = await react.run(() => panel({ sessionId: 's1' }))
-    assert.match(collectText(resolved).join('\n'), /清理探针/)
-    assert.equal(collectButtons(resolved).length, 0, 'awaiting-agent 时不该再给按钮（防连点）')
-
-    globalThis.fetch = async () => ({
-      ok: true,
-      json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'reproduced' } }),
-    })
-    const reproduced = await react.run(() => panel({ sessionId: 's1' }))
-    assert.match(collectText(reproduced).join('\n'), /下一轮/)
   } finally {
     globalThis.fetch = originalFetch
   }

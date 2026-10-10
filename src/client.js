@@ -1,8 +1,8 @@
 /**
  * src/client.js —— 浏览器半源码（**由 scripts/build-client.mjs 编译成 lib/client.js**）。
  *
- * 这一版是 M4 的**可用面板**：座位注册、1s 轮询、三态渲染、按钮接线、草稿协调、
- * 收尾三态、样式令牌全部就位。
+ * 这一版是**输入框上方那张可折叠的浮动卡片**：座位、轮询、折叠、三态渲染、按钮接线、
+ * 草稿协调、样式令牌全部就位。
  *
  * 硬约束（改本文件前先读 DESIGN.md §9.1）：
  *   · 只能 `import` 平台种子表里的模块（目前只用到 `react`），构建脚本会拦截违规。
@@ -11,9 +11,11 @@
  *   · 座位只注册一次却服务**所有会话**，必须按 `sessionId` 自过滤，无关时 `return null`；
  *     绝不要在模块级放"当前任务"这类全局状态。
  *
- * 座位选型（§9.1.3）：`conversation.composer.dock`，不是 turnTail。
- * 理由是它给到 `useInput`——面板因此能看见用户正在打什么，从而避免
- * 「打了半句描述又顺手点按钮 ⇒ 同一条信息送两遍」的竞态（§9.3.1）。
+ * 座位选型（§9.1.3）：`conversation.input.dock`——首方把它在**输入框卡片正上方**按普通
+ * 文档流渲染（`composerStack` 里 `renderSlot("conversation.input.dock", zone)` 紧跟着就是
+ * `inputBar`），所以它既贴近输入框、又**不可能遮挡**输入框。
+ * 早先用的 `conversation.composer.dock` 渲染在卡片**下方**，会把输入框往上挤，
+ * 正是"挤兑了提示词输入框的位置"那个问题。
  */
 
 import { createElement, useEffect, useState } from 'react'
@@ -27,8 +29,22 @@ const ROUTE_PREFIX = '/dsh-debug-mode'
 /** 轮询间隔：面板只需要"用户复现完"这一个时刻，1s 足够，也不至于打爆宿主。 */
 const POLL_MS = 1000
 
-/** 座位 key（本插件自己的 id，不会覆盖首方在同一个 dock 里的 cell）。 */
+/** 座位 key（本插件自己的 id，不会覆盖别人在同一个 dock 里的 cell）。 */
 const SLOT_ID = 'debug-mode-decision'
+
+/**
+ * 座位 key。首方把 `conversation.input.dock` 描述为 "Full-width entries above the
+ * composer card"，并且【在文档流里】渲染——所以它不会浮在输入框上面。
+ */
+const SLOT_KEY = 'conversation.input.dock'
+
+/**
+ * 在同座位里的排序位置。
+ *
+ * 该座位现有占用者是 `todo`(0) / `goal`(10) / `queue`(20)，都在我们前面；
+ * 取 30 意味着这张卡片排在**紧贴输入框**的那一格——需要用户动手的东西应该离手最近。
+ */
+const SLOT_ORDER = 30
 
 /** 样式表标识：按它去重，避免 HMR 后插进来七八份。 */
 const STYLE_ID = 'dsh-plugin-debug-mode/panel.css'
@@ -37,10 +53,8 @@ const STYLE_ID = 'dsh-plugin-debug-mode/panel.css'
  * 输入框里有没有"还没发出去的内容"。
  *
  * ⚠️ 字段名是**实测**的，不是猜的：`@deepseek-ai/dsh-client-ui-conversation` 的
- * `SessionInputShell.compose()` 就是 `{ draft: this.projection.clipboardText,
- * attachmentIds, draftRev, phase, occurrences, queue }`，而它自己比较草稿用的也是
- * `inputState.draft === ""`。（早先按候选字段名探测的写法已按 DESIGN.md §15 第 6 项
- * 的要求删掉——探测会在字段改名时静默失效，写死反而会在同一时刻立刻暴露。）
+ * `SessionInputShell.compose()` 就是 `{ draft, attachmentIds, draftRev, phase,
+ * occurrences, queue }`，而它自己比较草稿用的也是 `inputState.draft === ""`。
  *
  * 「有附件但没文字」也算未发送内容：那种状态下点按钮同样是"同一条信息送两遍"。
  *
@@ -54,12 +68,17 @@ function hasDraft(input) {
   return false
 }
 
-/** 状态 → 中文标签（面板头部）。 */
-function statusLabel(status) {
+/**
+ * 一句话状态（折叠时**只剩这一行**，所以它必须自己说清楚现在轮到谁）。
+ *
+ * 折叠态不能是"信息量为零"的一个色块：用户很可能就靠它决定要不要展开。
+ */
+function statusLine(status, verdict) {
   switch (status) {
     case 'active': return 'Agent 正在埋点/排查'
-    case 'awaiting-user': return '等你复现并选择'
-    case 'awaiting-agent': return '已通知 Agent…'
+    case 'awaiting-user': return '轮到你复现并选择'
+    case 'awaiting-agent':
+      return verdict === 'resolved' ? '已通知 Agent 清理探针' : '已通知 Agent 读日志'
     case 'closed': return '已结束'
     default: return String(status ?? '')
   }
@@ -107,30 +126,69 @@ async function postSignal(signal, input) {
   }
 }
 
-/** 面板的样式表：全部走 `--dsw-alias-*` 主题令牌，并且**每一处都带 fallback**。 */
+/**
+ * 面板样式：一张**浮动卡片**。
+ *
+ * 令牌来源有两级，都在注释里写清楚，免得下一个人以为是猜的：
+ *   · `client/Theme` inspect provider 给出的权威别名令牌（bg-layer-*、border-l*、
+ *     label-*、brand-primary、state-*）——这些是**可以照着写**的；
+ *   · 首方样式表里实际出现过的补充令牌（radius-lg、elevation-panel、label-tertiary…）。
+ * 每一处 `var()` 都带 fallback：万一某个名字将来改了，最坏结果是"回到朴素外观"，
+ * 而不是整块面板变成透明/不可读。
+ */
 const CSS = [
-  '.dsh-debug-mode-panel{box-sizing:border-box;width:100%;margin:6px auto 0;display:flex;flex-direction:column;gap:8px;',
-  'padding:10px 12px;border-radius:var(--dsw-radius-lg,10px);',
+  // 卡片本体：宽高跟随 composer 卡片，居中——看起来才像"贴在输入框上方"，
+  // 而不是一条横穿整个窗口的横幅。
+  '.dsh-dbg{box-sizing:border-box;width:100%;',
+  'max-width:var(--dsh-composer-card-max-width,100%);margin:0 auto 6px;',
+  'border-radius:var(--dsw-radius-lg,10px);overflow:hidden;',
   'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.28));',
   'background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.06));',
+  'box-shadow:var(--dsw-elevation-panel,0 4px 16px rgba(0,0,0,.10));',
   'color:var(--dsw-alias-label-primary,inherit);font-size:13px;line-height:20px}',
-  '.dsh-debug-mode-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-weight:500}',
-  '.dsh-debug-mode-badge{flex:none;padding:0 6px;border-radius:999px;font-size:12px;font-weight:400;',
-  'color:var(--dsw-alias-label-secondary,#6b7280);background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.12))}',
-  '.dsh-debug-mode-count{margin-left:auto;flex:none;color:var(--dsw-alias-label-tertiary,#9ca3af);font-size:12px}',
-  '.dsh-debug-mode-report{white-space:pre-wrap;overflow:hidden;max-height:96px;',
+  // 需要用户动手时给一道品牌色左沿：折叠成一个色条也仍然"在说话"。
+  '.dsh-dbg.is-action{border-left:3px solid var(--dsw-alias-brand-primary,#2563eb)}',
+
+  // 头部：整行是一个 button（键盘可达、语义正确），折叠态下它是唯一可见的部分。
+  // `flex-wrap:nowrap` + `overflow:hidden` 是有意的：窄窗口下宁可让状态文字截断，
+  // 也不要把这一行折成两行——折叠的意义就是"只占一行"。
+  '.dsh-dbg-head{display:flex;align-items:center;flex-wrap:nowrap;gap:8px;width:100%;',
+  'box-sizing:border-box;overflow:hidden;',
+  'padding:6px 10px;margin:0;border:0;background:transparent;color:inherit;font:inherit;',
+  'text-align:left;cursor:pointer}',
+  '.dsh-dbg-head:hover{background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.10))}',
+  '.dsh-dbg-head:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#2563eb);outline-offset:-2px}',
+  '.dsh-dbg-chev{flex:none;width:12px;color:var(--dsw-alias-label-secondary,#6b7280)}',
+  '.dsh-dbg-title{flex:none;font-weight:500}',
+  '.dsh-dbg-sep{flex:none;color:var(--dsw-alias-label-secondary,#6b7280)}',
+  // 状态是这一行里最该被牺牲的（可以截断），meta 反而要完整——它是唯一的量化信息。
+  '.dsh-dbg-status{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;',
   'color:var(--dsw-alias-label-secondary,#6b7280)}',
-  '.dsh-debug-mode-hint{color:var(--dsw-alias-label-secondary,#6b7280)}',
-  '.dsh-debug-mode-actions{display:flex;gap:8px;flex-wrap:wrap}',
-  '.dsh-debug-mode-actions button{appearance:none;cursor:pointer;padding:4px 12px;border-radius:var(--dsw-radius-md,8px);',
-  'font-size:13px;line-height:22px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.35));',
+  '.dsh-dbg-spacer{flex:1 1 auto;min-width:0}',
+  '.dsh-dbg-meta{flex:none;color:var(--dsw-alias-label-secondary,#6b7280);font-size:12px}',
+  '.dsh-dbg.is-action .dsh-dbg-status{color:var(--dsw-alias-brand-primary,#2563eb)}',
+
+  // 正文
+  '.dsh-dbg-body{display:flex;flex-direction:column;gap:8px;padding:0 10px 10px}',
+  '.dsh-dbg-headline{margin:0;font-weight:500;white-space:pre-wrap;word-break:break-word}',
+  '.dsh-dbg-caption{color:var(--dsw-alias-label-secondary,#6b7280)}',
+  // 步骤区限高：清单再长也不许把输入框顶出视野（"不应遮挡输入框"这条同时管长度）。
+  '.dsh-dbg-steps{margin:0;padding-left:22px;max-height:132px;overflow-y:auto;',
+  'color:var(--dsw-alias-label-primary,inherit)}',
+  '.dsh-dbg-steps li{margin:2px 0;word-break:break-word}',
+
+  '.dsh-dbg-hint{color:var(--dsw-alias-label-secondary,#6b7280)}',
+  '.dsh-dbg-actions{display:flex;gap:8px;flex-wrap:wrap}',
+  // 两个按钮同权重：它们是一个二选一，把某一个做成"主按钮"等于替用户表态。
+  '.dsh-dbg-btn{appearance:none;cursor:pointer;padding:4px 12px;',
+  'border-radius:var(--dsw-radius-md,8px);font-size:13px;line-height:22px;',
+  'border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.35));',
   'background:transparent;color:var(--dsw-alias-label-primary,inherit)}',
-  '.dsh-debug-mode-actions button:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12))}',
-  '.dsh-debug-mode-actions button:disabled{cursor:not-allowed;opacity:.5}',
-  '.dsh-debug-mode-actions button.dsh-debug-mode-primary{border-color:transparent;',
-  'background:var(--dsw-alias-button-primary-fill,#2563eb);color:var(--dsw-alias-button-primary-text,#fff)}',
-  '.dsh-debug-mode-warn{color:var(--dsw-alias-label-warning,#b45309)}',
-  '.dsh-debug-mode-error{color:var(--dsw-alias-label-error,#b91c1c)}',
+  '.dsh-dbg-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.12))}',
+  '.dsh-dbg-btn:disabled{cursor:not-allowed;opacity:.5}',
+
+  '.dsh-dbg-warn{color:var(--dsw-alias-state-warn-primary,#b45309)}',
+  '.dsh-dbg-error{color:var(--dsw-alias-state-error-primary,#b91c1c)}',
 ].join('')
 
 /** 插一次样式表。`document` 在测试沙箱里不存在，所以必须判空。 */
@@ -144,21 +202,34 @@ function ensureStyles() {
 }
 
 /**
- * 调试面板。props 由座位给出（已核实 `conversation.composer.dock` 的 standardProps）：
+ * 调试面板。
+ *
+ * props 由座位给出（`conversation.input.dock` 的 standardProps 与 ownerProps 都已核实）：
  *   · sessionId —— 当前会话，直接给到，不需要从别处推
  *   · useInput(selector) —— 读输入框状态（用于草稿协调）
- *   · useSession(selector) —— 订阅会话状态切片
+ *   · input（ownerProps，InputZone.input）—— 同一份 InputState 的快照，作为兜底
  */
 function DebugPanel(props) {
   const sessionId = props.sessionId
   const useInput = props.useInput
+  const ownerInput = props.input ?? props.zone?.input
+
   const [task, setTask] = useState(null)
   const [busy, setBusy] = useState('')
   const [failure, setFailure] = useState('')
   const [verdictSent, setVerdictSent] = useState('')
+  /**
+   * 手动折叠覆盖：`{ status, collapsed }`——记的是"针对哪个状态折的"。
+   *
+   * 为什么不是简单的 boolean：默认策略要**跟着状态走**（轮到用户复现时自动展开，
+   * 其余时候自动收起），而用户手动折过之后这个选择应当保留到下一次状态变化为止。
+   * 把状态一起记下来，"是否需要覆盖"就变成了渲染期的一次比较——
+   * 不需要在轮询回调里跟陈旧闭包较劲，也不需要在 setState 的 updater 里做副作用。
+   */
+  const [foldOverride, setFoldOverride] = useState({ status: null, collapsed: false })
 
   // 草稿：有未发送内容时禁用两个按钮，避免同一条描述被送两遍（§9.3.1）。
-  // 钩子可选：拿不到就当空草稿（服务旧宿主）。
+  // 这个条件在同一个座位上是稳定的（standardProps 不会中途增减），所以不算违反 hooks 规则。
   let draft = false
   if (typeof useInput === 'function') {
     try {
@@ -166,6 +237,8 @@ function DebugPanel(props) {
     } catch {
       draft = false
     }
+  } else {
+    draft = hasDraft(ownerInput)
   }
 
   useEffect(() => {
@@ -175,8 +248,9 @@ function DebugPanel(props) {
       fetchTaskState(sessionId).then((next) => {
         if (!alive) return
         setTask(next)
+        if (!next) return
         // 宿主已经迁移过状态（用户的选择被接受）时，清掉本地的"发送中"标记。
-        if (next && next.status !== 'awaiting-user') {
+        if (next.status !== 'awaiting-user') {
           setBusy('')
           setVerdictSent(next.userVerdict ?? '')
         }
@@ -190,7 +264,7 @@ function DebugPanel(props) {
     }
   }, [sessionId])
 
-  // 坐席约定：没有内容就返回 null，否则每个会话的输入框下方都会挂一个空壳。
+  // 坐席约定：没有内容就返回 null，否则每个会话的输入框上方都会挂一个空壳。
   if (!sessionId || !task) return null
 
   const decide = (signal) => {
@@ -207,78 +281,120 @@ function DebugPanel(props) {
   }
 
   const waiting = task.status === 'awaiting-user'
+  const verdict = task.userVerdict || verdictSent
+  const resolved = verdict === 'resolved'
   const locked = busy !== '' || draft
-  const rows = []
+  const steps = Array.isArray(task.reproSteps) ? task.reproSteps : []
+  const headline = String(task.headline ?? '').trim()
 
-  rows.push(createElement('div', { className: 'dsh-debug-mode-head', key: 'head' },
-    createElement('span', { key: 'title' }, `调试模式 · 任务 ${task.hash} · 第 ${task.round} 轮`),
-    createElement('span', { className: 'dsh-debug-mode-badge', key: 'status' }, statusLabel(task.status)),
-    createElement('span', { className: 'dsh-debug-mode-count', key: 'count' },
-      `${task.logLines ?? 0} 行 · ${formatBytes(task.logBytes ?? 0)}`),
-  ))
+  // 折叠策略：默认"轮到用户就展开、其余收起"；用户手动折过之后，
+  // 这个选择只对**当前状态**有效，状态一变就回到默认策略。
+  const collapsed = foldOverride.status === task.status
+    ? foldOverride.collapsed === true
+    : task.status !== 'awaiting-user'
+  const toggleCollapsed = () => setFoldOverride({ status: task.status, collapsed: !collapsed })
 
-  if (task.lastReport) {
-    rows.push(createElement('div', { className: 'dsh-debug-mode-report', key: 'report' }, task.lastReport))
+  // ── 头部：折叠时唯一可见的一行，所以它自己必须说清楚"现在轮到谁" ──
+  const head = createElement('button', {
+    type: 'button',
+    key: 'head',
+    className: 'dsh-dbg-head',
+    'aria-expanded': collapsed ? 'false' : 'true',
+    title: collapsed ? '展开调试面板' : '收起调试面板',
+    onClick: toggleCollapsed,
+  },
+  createElement('span', { className: 'dsh-dbg-chev', key: 'chev' }, collapsed ? '▸' : '▾'),
+  createElement('span', { className: 'dsh-dbg-title', key: 'title' }, '调试模式'),
+  createElement('span', { className: 'dsh-dbg-sep', key: 'sep' }, '·'),
+  createElement('span', { key: 'hash' }, `#${task.hash}`),
+  createElement('span', { className: 'dsh-dbg-sep', key: 'sep2' }, '·'),
+  createElement('span', { key: 'round' }, `第 ${task.round} 轮`),
+  createElement('span', { className: 'dsh-dbg-status', key: 'status' }, `· ${statusLine(task.status, verdict)}`),
+  createElement('span', { className: 'dsh-dbg-spacer', key: 'spacer' }),
+  createElement('span', { className: 'dsh-dbg-meta', key: 'meta' },
+    `${task.logLines ?? 0} 行 · ${formatBytes(task.logBytes ?? 0)}`))
+
+  const body = []
+  if (collapsed !== true) {
+    // ① 一句简短的回复 —— 面板上第一个被读到的东西。
+    if (headline) body.push(createElement('p', { className: 'dsh-dbg-headline', key: 'headline' }, headline))
+
+    // ② 需要用户操作的复现步骤清单 —— 面板存在的理由。
+    if (waiting && steps.length > 0) {
+      body.push(createElement('div', { key: 'steps' },
+        createElement('div', { className: 'dsh-dbg-caption' }, '请按这个顺序复现：'),
+        createElement('ol', { className: 'dsh-dbg-steps' },
+          steps.map((step, index) => createElement('li', { key: `s${index}` }, step))),
+      ))
+    } else if (waiting) {
+      // 没给步骤时不留白：说清"该做什么"，而不是让用户对着一个按钮发呆。
+      body.push(createElement('div', { className: 'dsh-dbg-caption', key: 'nosteps' },
+        '请按你印象里的操作再复现一次；若步骤已经变了，直接在输入框里描述新的现象即可。'))
+    }
+
+    if (waiting) {
+      body.push(createElement('div', { className: 'dsh-dbg-hint', key: 'hint' },
+        draft
+          ? '输入框里有未发送的内容 —— 直接发送即可，它会被当成「问题复现，继续排查」。'
+          : '也可以不用按钮：直接在输入框里描述现象，同样算「还在」。',
+      ))
+      body.push(createElement('div', { className: 'dsh-dbg-actions', key: 'actions' },
+        createElement('button', {
+          type: 'button',
+          key: 'resolve',
+          className: 'dsh-dbg-btn',
+          disabled: Boolean(locked),
+          onClick: () => decide('resolve'),
+        }, '问题已解决'),
+        createElement('button', {
+          type: 'button',
+          key: 'reproduce',
+          className: 'dsh-dbg-btn',
+          disabled: Boolean(locked),
+          onClick: () => decide('reproduce'),
+        }, '问题复现，需要进一步修复'),
+      ))
+    } else if (task.status === 'awaiting-agent') {
+      // 收尾三态（§9.4）：用户永远该知道代码库被留下了什么。
+      body.push(createElement('div', { className: 'dsh-dbg-hint', key: 'pending' },
+        resolved
+          ? '已通知 Agent 清理探针 —— 探针不摘干净就不算结束，收尾结果会出现在本轮回复里。'
+          // 「复现」之后日志**保留**着：Agent 要先读它，读完、开下一轮时才清空。
+          : '已通知 Agent。这一轮的日志保留着，等它读完再开下一轮。',
+      ))
+    } else {
+      body.push(createElement('div', { className: 'dsh-dbg-hint', key: 'active' },
+        task.status === 'active'
+          ? 'Agent 正在改代码/埋点，等它交卷后这里会开放选择。'
+          : statusLine(task.status, verdict),
+      ))
+    }
+
+    // ⚠️ 失效必须可见（§16.3.0 第 2 条）：闸门依赖"能写、能扫"，
+    // 缺了这个前提就绝不能让界面看起来还在保护着。
+    if (task.detector && task.detector.available === false) {
+      body.push(createElement('div', { className: 'dsh-dbg-warn', key: 'detector' },
+        '残留检测未生效：宿主无法完整扫描这个工作区，收尾时的"已清理干净"结论不可靠。',
+        task.detector.writeProbeError
+          ? createElement('span', { key: 'why' }, `（${task.detector.writeProbeError}）`)
+          : null,
+      ))
+    }
+    for (const [index, note] of (task.notes ?? []).entries()) {
+      body.push(createElement('div', { className: 'dsh-dbg-warn', key: `note-${index}` }, note))
+    }
+    if (failure) {
+      body.push(createElement('div', { className: 'dsh-dbg-error', key: 'failure' },
+        `操作失败：${failure} —— 可以直接在输入框里把结论告诉 Agent。`))
+    }
   }
 
-  if (waiting) {
-    rows.push(createElement('div', { className: 'dsh-debug-mode-hint', key: 'hint' },
-      draft
-        ? '输入框里有未发送的内容 —— 直接发送即可，它会被当成「问题复现，继续排查」。'
-        : '可以直接在输入框描述现象，也可以在这里做个结论：',
-    ))
-    rows.push(createElement('div', { className: 'dsh-debug-mode-actions', key: 'actions' },
-      createElement('button', {
-        type: 'button',
-        key: 'resolve',
-        className: 'dsh-debug-mode-primary',
-        disabled: Boolean(locked),
-        onClick: () => decide('resolve'),
-      }, '问题已解决'),
-      createElement('button', {
-        type: 'button',
-        key: 'reproduce',
-        disabled: Boolean(locked),
-        onClick: () => decide('reproduce'),
-      }, '问题复现，需要进一步修复'),
-    ))
-  } else if (task.status === 'awaiting-agent') {
-    // 收尾三态（§9.4）：用户永远该知道代码库被留下了什么。
-    const resolved = (task.userVerdict || verdictSent) === 'resolved'
-    rows.push(createElement('div', { className: 'dsh-debug-mode-hint', key: 'pending' },
-      resolved
-        ? '已通知 Agent 清理探针 —— 探针不摘干净就不算结束，收尾结果会出现在本轮回复里。'
-        // 「复现」之后日志**保留**着：Agent 要先读它，读完、开下一轮时才清空。
-        : '已通知 Agent。这一轮的日志保留着，等它读完再开下一轮。',
-    ))
-  } else {
-    rows.push(createElement('div', { className: 'dsh-debug-mode-hint', key: 'active' },
-      task.status === 'active'
-        ? 'Agent 正在改代码/埋点，等它交卷后这里会开放选择。'
-        : statusLabel(task.status),
-    ))
-  }
-
-  // ⚠️ 失效必须可见（§16.3.0 第 2 条）：闸门依赖"能写、能扫"，
-  // 缺了这个前提就绝不能让界面看起来还在保护着。
-  const detectorBroken = task.detector && task.detector.available === false
-  if (detectorBroken) {
-    rows.push(createElement('div', { className: 'dsh-debug-mode-warn', key: 'detector' },
-      '残留检测未生效：宿主无法完整扫描这个工作区，收尾时的"已清理干净"结论不可靠。',
-      task.detector.writeProbeError
-        ? createElement('span', { key: 'why' }, `（${task.detector.writeProbeError}）`)
-        : null,
-    ))
-  }
-  for (const [index, note] of (task.notes ?? []).entries()) {
-    rows.push(createElement('div', { className: 'dsh-debug-mode-warn', key: `note-${index}` }, note))
-  }
-  if (failure) {
-    rows.push(createElement('div', { className: 'dsh-debug-mode-error', key: 'failure' },
-      `操作失败：${failure} —— 可以直接在输入框里把结论告诉 Agent。`))
-  }
-
-  return createElement('div', { className: 'dsh-debug-mode-panel' }, rows)
+  return createElement('div', {
+    className: waiting ? 'dsh-dbg is-action' : 'dsh-dbg',
+    // 折叠/展开对无障碍与测试都可见，不用去猜 DOM 结构。
+    'data-collapsed': collapsed ? 'true' : 'false',
+    'data-status': task.status,
+  }, [head, collapsed === true ? null : createElement('div', { className: 'dsh-dbg-body', key: 'body' }, body)])
 }
 
 /** 人类可读的字节数（面板上的日志量）。 */
@@ -296,9 +412,9 @@ export function apply(ctx) {
   ensureStyles()
   // inject 是「声明感知」的：座位声明塌陷时注册随之释放、回来时重装。
   // 绝不要裸调 ctx.slots.register —— 座位可能稍后才声明（见 DESIGN.md §9.1.3）。
-  ctx.slots.inject('conversation.composer.dock', () =>
+  ctx.slots.inject(SLOT_KEY, () =>
     ctx.slots.register(
-      { name: 'conversation.composer.dock', id: SLOT_ID, order: 100, label: () => '调试模式' },
+      { name: SLOT_KEY, id: SLOT_ID, order: SLOT_ORDER, label: () => '调试模式' },
       (props) => createElement(DebugPanel, props),
     ),
   )
