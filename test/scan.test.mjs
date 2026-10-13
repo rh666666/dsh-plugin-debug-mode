@@ -1,5 +1,5 @@
 /**
- * test/scan.test.mjs —— 防堆屎山那两台机器的守卫测试（DESIGN.md §16.3 R1/R2/R3）。
+ * test/scan.test.mjs —— 防堆屎山那两台机器的守卫测试（R1/R2/R3）。
  *
  * 这里的每一条断言都对应一个**会造成不可逆损失**的具体错误：
  *   · 误删用户代码（所以配对歧义必须进 unresolved，而不是"大概是这样"）；
@@ -138,10 +138,11 @@ test('removeBlocks 顺带收敛摘除缝上的多余空行（实测连续五轮�
   assert.equal(fixResult.text, withFix, '没有摘除动作时不许动任何空白')
 })
 
-test('指南 §7.2 推荐的 ✅ 写法：既不留填充空行，也不吃掉原地已有的空行', () => {
+test('指南推荐的 [ok] 写法（[x] = 会产生多余空行）：既不留填充空行，也不吃掉原地已有的空行', () => {
   const pre = `# dsh-debug:probe ${HASH} start`
   const post = `# dsh-debug:probe ${HASH} end`
-  // ✅ 写法 = 块前后**不加**填充；要视觉分隔就把空行放进块内（跟块一起消失）。
+  // [ok] 写法 = 块前后**不加**填充；要视觉分隔就把空行放进块内（跟块一起消失）。
+  // 反过来，[x] 写法（块外加填充）会在摘除后留下多余空行 —— 见本文件后面的对照组。
   const blockWithInnerBlank = [pre, '', "probe('x')", '', post]
 
   // 情形 1：原地**本来就有**一个空行 —— 必须原样保留（不许被"收敛"吃掉）
@@ -153,7 +154,7 @@ test('指南 §7.2 推荐的 ✅ 写法：既不留填充空行，也不吃掉�
   // 情形 2：原地**没有**空行 —— 摘完必须严丝合缝，一个空行都不许造出来
   const withoutBlank = ['a = 1', ...blockWithInnerBlank, 'b = 2'].join('\n')
   const r2 = removeBlocks(withoutBlank, HASH)
-  assert.equal(r2.text, ['a = 1', 'b = 2'].join('\n'), '✅ 写法必须做到"与插入前逐字相同"')
+  assert.equal(r2.text, ['a = 1', 'b = 2'].join('\n'), '[ok] 写法必须做到"与插入前逐字相同"')
   assert.equal(r2.collapsedBlankLines, 0)
 
   // 情形 3：原地有 2 个空行 —— 在**缝上**会被收敛到 1（这是刻意的取舍，见下）。
@@ -170,15 +171,15 @@ test('指南 §7.2 推荐的 ✅ 写法：既不留填充空行，也不吃掉�
     removeBlocks(twoBlanksAwayFromSeam, HASH).text,
     ['a = 1', '', '', 'b = 2', 'c = 3'].join('\n'),
     '远离缝的双空行是用户排版，不许动',
-  )
+)
 
-  // 对照组：❌ 写法（块外加填充）在"原地没有空行"时会多留 1 个空行 ——
-  // 这就是实测连续五轮的那个坑，也是指南 §7.2 要求把空行放进块内的理由。
+  // 对照组：[x] 写法（块外加填充）在"原地没有空行"时会多留 1 个空行 ——
+  // 这就是实测连续五轮的那个坑，也是指南 要求把空行放进块内的理由。
   // （注意：只在一侧加填充时留的是 1 个空行，收敛逻辑**不会**动它——
-  //   因为 1 个空行与"原地本来就有 1 个"无法区分，见 DESIGN §16.3 的记录。）
+  // 因为 1 个空行与"原地本来就有 1 个"无法区分，只能靠插入纪律。）
   const paddedBoth = ['a = 1', '', pre, "probe('x')", post, '', 'b = 2'].join('\n')
   const r4 = removeBlocks(paddedBoth, HASH)
-  assert.equal(r4.text, ['a = 1', '', 'b = 2'].join('\n'), '❌ 两侧都填充：修完后最多留 1 个空行（不再留 2 个）')
+  assert.equal(r4.text, ['a = 1', '', 'b = 2'].join('\n'), '[x] 两侧都填充：修完后最多留 1 个空行（不再留 2 个）')
   assert.equal(r4.collapsedBlankLines, 1, '收敛了 1 行，且必须报出来')
 
   const paddedOneSide = ['a = 1', pre, "probe('x')", post, '', 'b = 2'].join('\n')
@@ -198,7 +199,7 @@ test('原有的空行被包进标记内 ⇒ 它跟块一起消失（清理逻辑
   assert.equal(result.text, ['total = compute(rows)', 'return total'].join('\n'),
     '空行在标记内 ⇒ 被连带删除（这是**已知代价**，不是实现 bug：那段区间是宿主被授权删的部分）')
   assert.equal(result.collapsedBlankLines, 0,
-    '⚠️ 这不叫"收敛"，所以**不计入** collapsedBlankLines，收尾报告里也不会出现——别指望它兜底')
+    '[!] 这不叫"收敛"，所以**不计入** collapsedBlankLines，收尾报告里也不会出现——别指望它兜底')
 
   // 对照：同一个文件、同一个位置，只要把空行留在标记**外**，它就活下来。
   const blankOutside = ['total = compute(rows)', '', pre, "probe('x')", post, 'return total'].join('\n')
@@ -308,7 +309,7 @@ test('indexWorkspace 排除 .dsh/node_modules/.git，并返回截断标记而不
     assert.equal(index.error, null)
 
     const limited = await indexWorkspace(workspace.root, { maxFiles: 0 })
-    assert.equal(limited.truncated, true, '截断必须能被调用方看见（§16.3.0 第 2 条）')
+    assert.equal(limited.truncated, true, '截断必须能被调用方看见（第 2 条）')
   } finally {
     await workspace.cleanup()
   }
@@ -331,6 +332,27 @@ test('scanResidue：宽松发现、严格分类、hash 不属于任何已知任�
     assert.ok(scan.quarantine.some((entry) => entry.path === 'src/broken.js'),
       '格式残缺也必须进隔离区（下划线写法是真实现场）')
     assert.ok(!scan.affected.some((entry) => entry.path === 'src/clean.js'), '完全无标记的文件不该进候选集')
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('scanResidue：桩引用**两形态**都能被抓到（临时根与工作区回退根）', async () => {
+  // 为什么这条要单独钉住：产物现在默认落在**用户临时目录**里
+  // （`.../Temp/dsh-debug-mode/tasks/<hash>/runtime/probe.mjs`），而临时根不可写时
+  // 回退到工作区（`.dsh/debug-mode/tasks/<hash>/runtime/probe.mjs`）。
+  //
+  // 于是"业务代码里那句 import"有**两形态**，而两者的共同危险是一样的：桩会随任务目录
+  // 一起被删掉，调用还在的话代码直接编译不过。老正则只认带 `.dsh/` 的那一种，
+  // 临时根形态的引用会**扫得到、流程却不提示**——那正是"漏删的残留没有下游拦截"。
+  const workspace = await createWorkspace({
+    'src/temp-ref.js': `import { probe } from './dsh-debug-mode/tasks/${HASH}/runtime/probe.mjs'\n`,
+    'src/legacy-ref.js': `// file:///${'C:/Users/x/AppData/Local/Temp'}/dsh-debug-mode/tasks/${HASH}/runtime/probe.mjs\n`,
+  })
+  try {
+    const scan = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH] })
+    assert.deepEqual(scan.stubRefFiles.slice().sort(), ['src/legacy-ref.js', 'src/temp-ref.js'],
+      '两形态都必须被列出来——只认 `.dsh/` 那一形态会让临时根形态静默漏掉')
   } finally {
     await workspace.cleanup()
   }
@@ -371,7 +393,7 @@ test('planCleanup + applyCleanup：先备份再写，且 fix 块原样保留', a
   }
 })
 
-test('verifySyntax 严格区分 failed 与 unverifiable（§16.4 的教训）', () => {
+test('verifySyntax 严格区分 failed 与 unverifiable（的教训）', () => {
   const verdicts = verifySyntax({
     'ok.cjs': 'module.exports = 1\n',
     'broken.cjs': 'function ( { \n',

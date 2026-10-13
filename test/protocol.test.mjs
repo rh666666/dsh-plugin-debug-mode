@@ -64,7 +64,7 @@ test('三处实现（协议模块 / Node 桩 / 浏览器桩）对同一批超限
   const dir = await mkdtemp(join(tmpdir(), 'dsh-degrade-parity-'))
   try {
     // ── 载体 1：协议模块 ──
-    // ⚠️ `ts` 必须与两个桩生成的**等长**（ISO-8601 带毫秒与偏移 = 29 字符）。
+    // [!] `ts` 必须与两个桩生成的**等长**（ISO-8601 带毫秒与偏移 = 29 字符）。
     // 因为 `ts` 参与 8 KiB 预算的计算：给它 7 个字符（`'FIXED'`）会让降级二分出与桩
     // 不同的 clip limit，两者"逐字比对"必然不一致——而事后归一化 `ts` 补不回来
     // （预算已经按不同的输入算过了）。第一版就是这么红的。
@@ -127,10 +127,15 @@ test('三处实现（协议模块 / Node 桩 / 浏览器桩）对同一批超限
 })
 
 test('byteLength 按 UTF-8 算字节（中文 3 字节、代理对 4 字节）', () => {
+  // 4 字节夹具用 `String.fromCodePoint` 拼出来，**不留字面量 emoji**：
+  // 仓库里任何文本文件都不带 emoji（终端/CI 的编码与字形回退各不相同），
+  // 而这里需要的只是"一个代理对"，用码点构造既准确又不会变成乱码。
+  const ASTRAL = String.fromCodePoint(0x1F600)
+  assert.equal(ASTRAL.length, 2, '代理对在 JS 里是两个 UTF-16 码元')
   assert.equal(byteLength('abc'), 3)
   assert.equal(byteLength('中'), 3)
-  assert.equal(byteLength('😀'), 4, '代理对必须算 4 字节而不是 2+3')
-  assert.equal(byteLength('中a😀'), 3 + 1 + 4)
+  assert.equal(byteLength(ASTRAL), 4, '代理对必须算 4 字节而不是 2+3')
+  assert.equal(byteLength(`中a${ASTRAL}`), 3 + 1 + 4)
 })
 
 test('formatRecord 字段序稳定、可被 parseRecord 还原', () => {
@@ -157,7 +162,7 @@ test('formatRecord 字段序稳定、可被 parseRecord 还原', () => {
   assert.deepEqual(
     Object.keys(JSON.parse(line)),
     [...RECORD_FIELDS.filter((f) => f !== 'data' && f !== 'truncated'), 'data'],
-  )
+)
 })
 
 test('formatRecord 在 ts 缺失时补时间戳，在 probe 缺失时抛错', () => {
@@ -206,11 +211,15 @@ test('createHash 是 8 位小写十六进制且不重复', () => {
   }
 })
 
-test('路径约定冻结：日志落在任务目录内', () => {
+test('路径约定冻结：任务目录是**相对产物根**的形状（`tasks/<hash>/…`）', () => {
+  // 形状里**没有** `.dsh/debug-mode` 前缀：产物根是运行时解析出来的
+  // （用户临时目录优先，不可写才回退 `<workspace>/.dsh/debug-mode`），
+  // 所以 "相对仓库根" 这个前提已经不成立了——绝对路径由
+  // `DebugService.taskAbsDir(task)` 拼。
   const hash = 'deadbeef'
-  assert.equal(taskDir(hash), '.dsh/debug-mode/tasks/deadbeef')
-  assert.equal(logPath(hash), '.dsh/debug-mode/tasks/deadbeef/deadbeef.log')
-  assert.equal(probeStubPath(hash), '.dsh/debug-mode/tasks/deadbeef/runtime/probe.mjs')
+  assert.equal(taskDir(hash), 'tasks/deadbeef')
+  assert.equal(logPath(hash), 'tasks/deadbeef/deadbeef.log')
+  assert.equal(probeStubPath(hash), 'tasks/deadbeef/runtime/probe.mjs')
 })
 
 test('状态机：合法迁移放行，非法迁移抛错', () => {
@@ -226,7 +235,7 @@ test('状态机：合法迁移放行，非法迁移抛错', () => {
 })
 
 test('探针账与修复账分开记：probeFiles 与 changedFiles 是两个数组', () => {
-  // DESIGN.md §3.8：收尾只撤探针，绝不回滚用户的修复。两条账混在一起就会误删修复，
+  //：收尾只撤探针，绝不回滚用户的修复。两条账混在一起就会误删修复，
   // 所以这里把「它们必须是两个独立字段」钉住。
   const task = createTask({ hash: 'deadbeef', sessionId: 's1', workspace: '/w', goal: 'g' })
   assert.deepEqual(task.probeFiles, [])
@@ -273,7 +282,7 @@ test('renderProbeStub 烘死 hash 与日志绝对路径，且桩能真的写出�
   }
 })
 
-test('探针桩在日志达到 16 MiB 上限后停止追加，并只写一条 overflow 说明（§11.2）', async () => {
+test('探针桩在日志达到 16 MiB 上限后停止追加，并只写一条 overflow 说明', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-debug-mode-cap-'))
   try {
     const logAbs = join(dir, 'cap.log')
@@ -306,7 +315,7 @@ test('renderProbeStub 在模板锚点缺失时抛错', async () => {
   await assert.rejects(
     () => renderProbeStub({ template: '// nothing here', hash: 'x', logAbsolutePath: '/tmp/x.log' }),
     /anchor missing/,
-  )
+)
 })
 
 test('桩写出的原始行与协议模块的字段序逐字一致（防止两处实现漂移）', async () => {

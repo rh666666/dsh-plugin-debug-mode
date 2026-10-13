@@ -1,5 +1,5 @@
 /**
- * test/ingest.test.mjs —— HTTP 探针通道的守卫（DESIGN.md §7.6）。
+ * test/ingest.test.mjs —— HTTP 探针通道的守卫。
  *
  * 这条通道存在的唯一理由是：**调试模式不该需要任何命令**。
  * 浏览器页面（`file://`）既不能 import Node 桩、也没有文件系统；过去唯一的出路是
@@ -22,22 +22,41 @@ import { DebugService, normalizeProbePayload, LOG_WARN_BYTES } from '../lib/debu
 import { renderBrowserStub, renderHttpGuide } from '../lib/probe-template.js'
 import { RECORD_FIELDS, byteLength, parseLog } from '../lib/protocol.js'
 import { ROUTE_PREFIX, registerRoutes } from '../lib/routes.js'
-import { createFakeContext, createWorkspace } from './helpers.mjs'
+import { createArtifactBase, createFakeContext, createWorkspace } from './helpers.mjs'
 
 const SESSION = 'session-aaaa'
 
-/** 起服务并开一个任务；返回 { service, fake, workspace, task }。 */
+/**
+ * 任务的日志绝对路径。
+ *
+ * 从前这里手拼 `.dsh/debug-mode/tasks/...`：产物根现在是**运行时解析**出来的
+ * （临时目录优先），手拼的那一份从那一刻起就不再是真相——它会指到一个不存在的文件，
+ * 于是测试看到的是"日志是空的"而不是"读错了地方"。
+ */
+function logOf(started) {
+  return join(started.artifactRoot, 'tasks', started.hash, `${started.hash}.log`)
+}
+
+
+/**
+ * 起服务并开一个任务；返回 { service, fake, workspace, started, art }。
+ *
+ * [!] 每处都要注入自己的 `tempDir`：产物默认落在用户临时目录里，而 `node --test`
+ * 会并行跑多个测试文件——共用真实 `%TEMP%/dsh-debug-mode` 会让
+ * 「只认活跃任务的哈希」这类断言撞上别的测试文件留下的任务。
+ */
 async function setupTask() {
   const workspace = await createWorkspace({
     'src/app.js': 'export const a = 1\n',
     'buggy-demo.html': '<html><body><button id="add">+</button></body></html>\n',
   })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
   await service.issueTicket({ sessionId: SESSION, text: '页面上的按钮点了没反应', workspace: workspace.root })
   const started = await service.start({ sessionId: SESSION, goal: '页面上的按钮点了没反应', workspace: workspace.root })
   assert.equal(started.ok, true, started.text)
-  return { service, fake, workspace, started }
+  return { service, fake, workspace, started, art }
 }
 
 /** 极简 req/res 替身（与 wiring 测试同形，这里只有摄入路由需要）。 */
@@ -92,7 +111,7 @@ test('normalizeProbePayload 三种形态都认，认不出来就返回空（绝�
 })
 
 test('ingestProbe：落盘用同一份协议，task 由宿主写死，ts 缺失时由宿主补', async () => {
-  const { service, workspace, started } = await setupTask()
+  const { service, workspace, started, art } = await setupTask()
   try {
     const result = await service.ingestProbe({
       hash: started.hash,
@@ -102,10 +121,10 @@ test('ingestProbe：落盘用同一份协议，task 由宿主写死，ts 缺失�
     assert.equal(result.accepted, 1)
     assert.equal(result.rejected, 0)
 
-    const raw = (await readFile(join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash, `${started.hash}.log`), 'utf8')).trimEnd()
+    const raw = (await readFile(started.logPath, 'utf8')).trimEnd()
     const parsed = JSON.parse(raw)
-    // 	runcated 是可选字段：这条没被降级，就不该出现。RECORD_FIELDS 里的位置仍然钉住顺序。
-      assert.deepEqual(Object.keys(parsed), RECORD_FIELDS.filter((field) => field !== 'truncated'), '字段序必须与冻结协议逐字一致')
+    // `truncated` 是可选字段：这条没被降级，就不该出现。RECORD_FIELDS 里的位置仍然钉住顺序。
+    assert.deepEqual(Object.keys(parsed), RECORD_FIELDS.filter((field) => field !== 'truncated'), '字段序必须与冻结协议逐字一致')
     assert.equal(parsed.task, started.hash, 'task 必须由宿主写死')
     assert.match(parsed.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}$/, 'ts 由宿主补')
     assert.equal(parsed.probe, 'buggy-demo.html:42:click')
@@ -116,19 +135,18 @@ test('ingestProbe：落盘用同一份协议，task 由宿主写死，ts 缺失�
       hash: started.hash,
       payload: [{ task: 'ffffffff', ts: '2020-01-01T00:00:00.000+00:00', probe: 'x:1:y' }],
     })
-    const { records } = parseLog(await readFile(
-      join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash, `${started.hash}.log`), 'utf8',
-    ))
+    const { records } = parseLog(await readFile(started.logPath, 'utf8'))
     assert.equal(records.length, 2)
     assert.equal(records[1].task, started.hash, '投递方谎报的 task 必须被覆盖')
     assert.equal(records[1].ts, '2020-01-01T00:00:00.000+00:00', '合法 ts 可以采信（跨进程时序要保留）')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('ingestProbe：脏记录被计数拒绝，但没有 probe 的整批不会污染日志', async () => {
-  const { service, workspace, started } = await setupTask()
+  const { service, workspace, started, art } = await setupTask()
   try {
     const result = await service.ingestProbe({
       hash: started.hash,
@@ -142,18 +160,17 @@ test('ingestProbe：脏记录被计数拒绝，但没有 probe 的整批不会�
     assert.equal(empty.code, 400)
     assert.equal(empty.accepted, 0)
 
-    const { records, dirtyLines } = parseLog(await readFile(
-      join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash, `${started.hash}.log`), 'utf8',
-    ))
+    const { records, dirtyLines } = parseLog(await readFile(started.logPath, 'utf8'))
     assert.equal(records.length, 1)
     assert.equal(dirtyLines, 0, '宿主自己序列化 ⇒ 永远不写脏行')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('ingestProbe：只认活跃任务的哈希（投递方不能借它写别的地方）', async () => {
-  const { service, workspace, started } = await setupTask()
+  const { service, workspace, started, art } = await setupTask()
   try {
     const unknown = await service.ingestProbe({ hash: 'ffffffff', payload: { probe: 'x' } })
     assert.equal(unknown.ok, false)
@@ -175,12 +192,13 @@ test('ingestProbe：只认活跃任务的哈希（投递方不能借它写别的
     assert.equal(afterClose.code, 404, '任务目录已删 ⇒ 找不到任务')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('ingestProbe：单行超 8 KiB 截断并标 truncated；到 16 MiB 只写一条 overflow', async () => {
-  const { service, workspace, started } = await setupTask()
-  const logAbs = join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash, `${started.hash}.log`)
+  const { service, workspace, started, art } = await setupTask()
+  const logAbs = logOf(started)
   try {
     await service.ingestProbe({
       hash: started.hash,
@@ -207,11 +225,12 @@ test('ingestProbe：单行超 8 KiB 截断并标 truncated；到 16 MiB 只写�
     assert.ok(service.debts.some((entry) => entry.key === `log-size:${started.hash}`), '到顶要写进欠账')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('摄入路由：CORS 头齐全、OPTIONS 预检 204、GET 自检、非法方法 405、体过大 400', async () => {
-  const { service, fake, workspace, started } = await setupTask()
+  const { service, fake, workspace, started, art } = await setupTask()
   try {
     registerRoutes(fake.ctx, service)
     const route = fake.routes.find((item) => item.path === `${ROUTE_PREFIX}/probe`)
@@ -276,6 +295,7 @@ test('摄入路由：CORS 头齐全、OPTIONS 预检 204、GET 自检、非法�
     assert.equal((await tooBig.deliver()).status, 400)
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
@@ -316,7 +336,7 @@ test('浏览器桩：在 vm 沙箱里真的按同一协议发出一条记录（s
   const { sandbox, beacons, timers } = run()
   assert.equal(typeof sandbox.dshProbe, 'function', '经典脚本要挂在全局上（页面不能 import 它）')
 
-  // ★ 加载即报到：脚本一执行就该发出一条 `debug-mode:ready`（并且立刻冲刷）。
+  // (*) 加载即报到：脚本一执行就该发出一条 `debug-mode:ready`（并且立刻冲刷）。
   // 这一条同时证明「桩加载了」与「通道是通的」——没有它，"通道死了"和"埋点没执行"
   // 的现象一模一样（日志一片空白）。所以它必须是**不需要页面显式调用**的。
   assert.equal(beacons.length, 1, 'ready 记录必须在加载时立刻发出，不等 200ms 批量')
@@ -398,16 +418,20 @@ test('多语言片段：占位符全部替换、锚点缺失即抛错（别让 A
   await assert.rejects(
     () => renderHttpGuide({ template: '# 什么都没有', hash: 'x', endpoint: 'y', logPath: 'z', probeStub: 'w' }),
     /placeholder missing/,
-  )
+)
 })
 
 test('通道自检（probeStatus）：报出通道收过多少条，并给一句可照做的提示', async () => {
-  const { service, workspace, started } = await setupTask()
+  const { service, workspace, started, art } = await setupTask()
   try {
     const before = await service.probeStatus(started.hash)
     assert.equal(before.ok, true)
     assert.equal(before.httpRecords, 0)
     assert.equal(before.logLines, 0)
+    // `logPath` 是新增字段：通道自检的返回值要能直接指出日志在哪。
+    // 从前只能靠调用方自己拼 `.dsh/debug-mode/...`，而产物根现在是运行时解析的
+    // （临时目录优先），拼出来的那一份从那一刻起就不再是真相。
+    assert.equal(before.logPath, service.pathsOf(started).log)
     assert.match(before.hint, /还没有记录送进来/)
 
     // 最小调用：**只有 probe 一个字段**——任何语言写一行 JSON 就能埋点，这就是"统一入口"。
@@ -418,17 +442,19 @@ test('通道自检（probeStatus）：报出通道收过多少条，并给一句
     assert.equal(after.httpRecords, 1)
     assert.ok(after.httpLastAt > 0)
     assert.equal(after.logLines, 1)
+    assert.equal(after.logPath, started.logPath)
     assert.match(after.hint, /已经送进来过 1 条/)
 
     assert.equal((await service.probeStatus('ffffffff')).code, 404)
     assert.equal((await service.probeStatus('not-a-hash')).code, 400)
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('report 把通道状态摆出来：日志为空时"通道没通"与"用户还没复现"必须能区分', async () => {
-  const { service, workspace, started } = await setupTask()
+  const { service, workspace, started, art } = await setupTask()
   try {
     const report = await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第一轮' })
     assert.equal(report.ok, true)
@@ -455,44 +481,52 @@ test('report 把通道状态摆出来：日志为空时"通道没通"与"用户�
     assert.ok(!/还从未被验证过/.test(second.text), '通道已经验证过了，不该再念那段自检话')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('端点来源：DSH_WEB_URL 优先，其次是 webServer.port（权威且总在手里）', async () => {
   const previous = process.env.DSH_WEB_URL
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  // 这四条只解析地址、不开任务，但**仍然注入自己的 tempDir**：产物根是构造参数的一部分，
+  // 让某一条悄悄用上真实 `%TEMP%` 就是给并行测试留一个"偶尔才红"的坑。
+  const art = await createArtifactBase()
   try {
     // ① 两个都有时，环境变量优先（部署可能把它改成代理/隧道地址）。
     process.env.DSH_WEB_URL = 'https://debug.example.com'
-    const envFirst = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 19387 }).ctx)
+    const envFirst = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 19387 }).ctx, { tempDir: art.base })
     assert.equal(envFirst.endpointBase(), 'https://debug.example.com')
     assert.equal(envFirst.probeEndpoint('deadbeef'), 'https://debug.example.com/dsh-debug-mode/probe?h=deadbeef')
 
     // ② 没有环境变量 ⇒ 用 webServer.port 拼回环地址。这正是"Agent 知道 origin
-    //    却不知道路径"那件事的正解：地址本来就在插件自己手里。
+    // 却不知道路径"那件事的正解：地址本来就在插件自己手里。
     delete process.env.DSH_WEB_URL
-    const ported = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 19387 }).ctx)
+    const ported = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 19387 }).ctx, { tempDir: art.base })
     assert.equal(ported.endpointBase(), 'http://127.0.0.1:19387')
     assert.equal(ported.probeEndpoint('deadbeef'), 'http://127.0.0.1:19387/dsh-debug-mode/probe?h=deadbeef')
+    // 浏览器桩 URL 与摄入端点同源（都由 endpointBase() 推出），只差路径。
+    assert.equal(ported.browserStubUrl('deadbeef'), 'http://127.0.0.1:19387/dsh-debug-mode/stub.js?h=deadbeef')
 
     // ③ 两个都没有 ⇒ null（绝不猜端口），由调用方明说。
-    const bare = new DebugService(createFakeContext({ cwd: workspace.root }).ctx)
+    const bare = new DebugService(createFakeContext({ cwd: workspace.root }).ctx, { tempDir: art.base })
     assert.equal(bare.endpointBase(), null)
     assert.equal(bare.probeEndpoint('deadbeef'), null)
+    assert.equal(bare.browserStubUrl('deadbeef'), null)
 
     // ④ 非法端口同样不猜。
-    const bogus = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 70000 }).ctx)
+    const bogus = new DebugService(createFakeContext({ cwd: workspace.root, webPort: 70000 }).ctx, { tempDir: art.base })
     assert.equal(bogus.endpointBase(), null)
   } finally {
     if (previous === undefined) delete process.env.DSH_WEB_URL
     else process.env.DSH_WEB_URL = previous
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('宿主摄入路径**不许有任何静默截断**：要么值完整，要么带 truncated 标记', async () => {
-  const { service, workspace, started } = await setupTask()
-  const logAbs = join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash, `${started.hash}.log`)
+  const { service, workspace, started, art } = await setupTask()
+  const logAbs = logOf(started)
   try {
     // 实测踩过的坑（v0.16）：`ingestProbe` 里曾有两条**没写进任何文档**的预截断——
     // `probe.slice(0, 200)` 与 `msg.slice(0, 2000)`。于是 10000 字符的 msg 被悄悄砍到
@@ -532,6 +566,7 @@ test('宿主摄入路径**不许有任何静默截断**：要么值完整，要�
     assert.equal(after.records[after.records.length - 1].probe, longProbe, '长 probe 标识不该被静默砍短')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
@@ -542,39 +577,63 @@ async function lastRawLine(logAbsolute) {
 }
 
 test('start 会写出浏览器桩与多语言片段并把端点交给 Agent；端点未知时不写假地址', async () => {
-  const { service, workspace, started } = await setupTask()
+  const { service, fake, workspace, started, art } = await setupTask()
   const previous = process.env.DSH_WEB_URL
   try {
-    const dir = join(workspace.root, '.dsh', 'debug-mode', 'tasks', started.hash)
-    const guide = await readFile(join(dir, 'AGENT-PROBE-GUIDE.md'), 'utf8')
-    // 指南里的两个新变量都必须被替换掉（残留占位符 = Agent 会照着字面量干活）。
+    const paths = service.pathsOf(started)
+    const guide = await readFile(paths.guide, 'utf8')
+    // 指南里的新变量都必须被替换掉（残留占位符 = Agent 会照着字面量干活）。
     assert.ok(!guide.includes('{{'), '指南不得残留占位符')
     assert.match(guide, /不要运行任何命令/)
 
     if (previous && /^https?:\/\//i.test(previous)) {
-      const stub = await readFile(join(dir, 'runtime', 'probe.browser.js'), 'utf8')
+      const stub = await readFile(paths.browserStub, 'utf8')
       assert.ok(!stub.includes('__DSH_ENDPOINT__'))
       assert.ok(stub.includes(`${previous.replace(/\/+$/, '')}${ROUTE_PREFIX}/probe?h=${started.hash}`),
         '端点必须是宿主的绝对地址（页面在 file:// 下，相对路径到不了宿主）')
       // 多语言片段也必须生成，并且端点/哈希都烘死好了。
-      const snippets = await readFile(join(dir, 'runtime', 'probe.http.md'), 'utf8')
+      const snippets = await readFile(paths.httpGuide, 'utf8')
       assert.ok(!snippets.includes('{{'), '片段不得残留占位符')
       assert.ok(snippets.includes(`?h=${started.hash}`))
       assert.match(started.text, /HTTP 摄入端点/)
-      assert.match(started.text, /浏览器探针桩/)
+      assert.match(started.text, /浏览器桩/)
       assert.match(started.text, /埋点优先走 HTTP 通道/, 'start 的返回值必须把 HTTP 摆在首选位置')
       assert.match(started.text, /自检/, '并且提醒先自检再让用户复现')
     } else {
       // 端口未知时**不写一个猜的地址**：猜错的后果是探针静默丢失，
       // 那正是这个插件最不能接受的失败方式——所以宁可不生成，也要明说。
-      const stubExists = await readFile(join(dir, 'runtime', 'probe.browser.js'), 'utf8').then(() => true, () => false)
+      const stubExists = await readFile(paths.browserStub, 'utf8').then(() => true, () => false)
       assert.equal(stubExists, false, '宿主地址未知时不该生成一个端点填错的桩')
-      const snippetsExist = await readFile(join(dir, 'runtime', 'probe.http.md'), 'utf8').then(() => true, () => false)
+      const snippetsExist = await readFile(paths.httpGuide, 'utf8').then(() => true, () => false)
       assert.equal(snippetsExist, false, '同理：多语言片段也不该带着假端点生成')
       assert.match(started.text, /宿主地址未知/)
       assert.match(guide, /宿主地址未知/)
     }
+
+    // 指南必须带上**浏览器桩 URL**：产物住在用户临时目录里，项目看不见那个文件，
+    // 页面唯一的引法就是让宿主伺服它（`<script src=".../stub.js?h=<hash>">`）。
+    // 这一条第 10 项契约要的是"指南正文里真的有这个 URL"，而不是"桩文件被生成了"。
+    delete process.env.DSH_WEB_URL
+    const localArt = await createArtifactBase()
+    const localFake = createFakeContext({ cwd: workspace.root, webPort: 19387 })
+    const local = new DebugService(localFake.ctx, { logger: localFake.ctx.logger, tempDir: localArt.base })
+    try {
+      await local.issueTicket({ sessionId: SESSION, text: 'x', workspace: workspace.root })
+      const localStarted = await local.start({ sessionId: SESSION, goal: 'x', workspace: workspace.root })
+      assert.equal(localStarted.ok, true, localStarted.text)
+      const localGuide = await readFile(local.pathsOf(localStarted).guide, 'utf8')
+      assert.ok(!localGuide.includes('{{'), '指南不得残留占位符（含 BROWSER_STUB_URL 那一个）')
+      assert.equal(local.browserStubUrl(localStarted.hash),
+        `http://127.0.0.1:19387${ROUTE_PREFIX}/stub.js?h=${localStarted.hash}`)
+      assert.ok(localGuide.includes(local.browserStubUrl(localStarted.hash)),
+        '指南正文必须含浏览器桩 URL —— 页面引不到它就只能去读文件系统')
+    } finally {
+      await localArt.cleanup()
+    }
   } finally {
+    if (previous === undefined) delete process.env.DSH_WEB_URL
+    else process.env.DSH_WEB_URL = previous
     await workspace.cleanup()
+    await art.cleanup()
   }
 })

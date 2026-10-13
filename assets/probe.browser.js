@@ -4,27 +4,30 @@
  * 为什么需要第二个桩：Node 桩靠 `node:fs` 直接追加写日志，而浏览器里的页面
  * （尤其是 `file://` 打开的静态页）**既不能 import 那个模块，也没有文件系统**。
  * 过去唯一的出路是"起个本地服务器把页面伺服出来"——那要跑命令，而调试模式
- * 本来就不该需要任何命令（DESIGN.md §3.10）。所以宿主自己开一条**只追加写**的
+ * 本来就不该需要任何命令。所以宿主自己开一条**只追加写**的
  * 摄入端点（`POST <端点>`），页面把记录按同一行协议 POST 过去。
  *
- * 协议完全相同（DESIGN.md §7.2）：一行一个 JSON 对象，字段序
+ * 协议完全相同：一行一个 JSON 对象，字段序
  * `ts, task, probe, level, msg, data`。宿主端用 `lib/protocol.js` 的 `formatRecord`
  * 重新序列化落盘，所以**这里只是传输，不是协议的第二个真相**。
  *
- * 用法（生成到 `<任务目录>/runtime/probe.browser.js` 后）：
+ * 用法：宿主路由 `GET /dsh-debug-mode/stub.js?h=<hash>` **即时渲染**这份脚本，
+ * 页面直接引那个地址即可（经典 `<script src>` **跨源可加载**，不需要 CORS 头、也不触发预检）：
  *   ```html
- *   <script src=".dsh/debug-mode/tasks/<hash>/runtime/probe.browser.js"></script>
+ *   <script src="http://127.0.0.1:<DSH 端口>/dsh-debug-mode/stub.js?h=<hash>"></script>
  *   <script> dshProbe('app.js:12:click', { itm }) </script>
  *   ```
+ * 为什么不改成让项目自己的 dev server 伺服它：产物现在住在**用户临时目录**里，
+ * 被调试的项目根本看不见它；而宿主的 `<script src>` 也不受 `file://` 那条限制。
  * 经典脚本（不是 module）——`file://` 源下浏览器会按 CORS 拦掉 module 与 fetch 本地文件，
- * 但同源的经典 `<script src>` 不受影响。若页面有 CSP 挡了它，就把本文件内容整段
- * 粘进一个探针块里。
+ * 而 `<script src>` 不受这条限制（产物副本仍会落在任务产物目录的 `runtime/probe.browser.js`）。
+ * 若页面 CSP 挡了跨源地址，就粘贴**宿主给出的落盘副本**（`runtime/probe.browser.js`）的内容。
  *
  * 硬约束（与 Node 桩同源）：
  *   · **永不抛异常**：可观测性代码不许把被调试的页面搞挂。
  *   · 单行 ≤ 8 KiB，超长截断并标 `truncated`。
  *   · 批量发送（默认 200ms 或攒够 32 条），并在页面卸载时冲刷一次——
- *     否则"用户复现完就关页面"会把现场一起带走。
+ * 否则"用户复现完就关页面"会把现场一起带走。
  *   · 请求是 CORS 简单请求（`text/plain`），不需要预检；响应内容一律不看。
  */
 

@@ -4,14 +4,14 @@
  * 这一版是**输入框上方那张可折叠的浮动卡片**：座位、轮询、折叠、三态渲染、按钮接线、
  * 草稿协调、样式令牌全部就位。
  *
- * 硬约束（改本文件前先读 DESIGN.md §9.1）：
+ * 硬约束（改本文件前先）：
  *   · 只能 `import` 平台种子表里的模块（目前只用到 `react`），构建脚本会拦截违规。
  *   · 本通道**没有** `host.call`、没有 `styles.insert`——宿主通信一律走同源 fetch，
- *     样式只能自己插 `<style>`。
+ * 样式只能自己插 `<style>`。
  *   · 座位只注册一次却服务**所有会话**，必须按 `sessionId` 自过滤，无关时 `return null`；
- *     绝不要在模块级放"当前任务"这类全局状态。
+ * 绝不要在模块级放"当前任务"这类全局状态。
  *
- * 座位选型（§9.1.3）：`conversation.input.dock`——首方把它在**输入框卡片正上方**按普通
+ * 座位选型：`conversation.input.dock`——首方把它在**输入框卡片正上方**按普通
  * 文档流渲染（`composerStack` 里 `renderSlot("conversation.input.dock", zone)` 紧跟着就是
  * `inputBar`），所以它既贴近输入框、又**不可能遮挡**输入框。
  * 早先用的 `conversation.composer.dock` 渲染在卡片**下方**，会把输入框往上挤，
@@ -23,7 +23,7 @@ import { createElement, useEffect, useState } from 'react'
 /** Cordis 依赖键列表。座位服务是 `slots`。 */
 export const inject = ['slots']
 
-/** 与宿主半约定的路由前缀（见 DESIGN.md §6.2 的路由表）。 */
+/** 与宿主半约定的路由前缀（ 的路由表）。 */
 const ROUTE_PREFIX = '/dsh-debug-mode'
 
 /** 轮询间隔：面板只需要"用户复现完"这一个时刻，1s 足够，也不至于打爆宿主。 */
@@ -52,7 +52,7 @@ const STYLE_ID = 'dsh-plugin-debug-mode/panel.css'
 /**
  * 输入框里有没有"还没发出去的内容"。
  *
- * ⚠️ 字段名是**实测**的，不是猜的：`@deepseek-ai/dsh-client-ui-conversation` 的
+ * [!] 字段名是**实测**的，不是猜的：`@deepseek-ai/dsh-client-ui-conversation` 的
  * `SessionInputShell.compose()` 就是 `{ draft, attachmentIds, draftRev, phase,
  * occurrences, queue }`，而它自己比较草稿用的也是 `inputState.draft === ""`。
  *
@@ -158,7 +158,13 @@ const CSS = [
   'text-align:left;cursor:pointer}',
   '.dsh-dbg-head:hover{background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.10))}',
   '.dsh-dbg-head:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#2563eb);outline-offset:-2px}',
-  '.dsh-dbg-chev{flex:none;width:12px;color:var(--dsw-alias-label-secondary,#6b7280)}',
+  // 折叠箭头用**内联 SVG**，不用字符箭头、更不碰 emoji：字符的字形回退按平台/字体各不相同
+  // （实测过 `▸` 在某些等宽字体下变成方框），而 SVG 的线条由我们自己画，到哪都一样。
+  // 方向只有一种画法：折起时朝右，展开时整块转 90°。
+  '.dsh-dbg-chev{flex:none;display:inline-flex;align-items:center;width:12px;',
+  'color:var(--dsw-alias-label-secondary,#6b7280)}',
+  '.dsh-dbg-svg{display:block;transition:transform .12s ease}',
+  '.dsh-dbg-head[aria-expanded="true"] .dsh-dbg-chev .dsh-dbg-svg{transform:rotate(90deg)}',
   '.dsh-dbg-title{flex:none;font-weight:500}',
   '.dsh-dbg-sep{flex:none;color:var(--dsw-alias-label-secondary,#6b7280)}',
   // 状态是这一行里最该被牺牲的（可以截断），meta 反而要完整——它是唯一的量化信息。
@@ -187,7 +193,11 @@ const CSS = [
   '.dsh-dbg-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.12))}',
   '.dsh-dbg-btn:disabled{cursor:not-allowed;opacity:.5}',
 
-  '.dsh-dbg-warn{color:var(--dsw-alias-state-warn-primary,#b45309)}',
+  // 警告块：图标是**内联 SVG**（一个实心三角 + 一个感叹号），文字照旧。
+  // 图标 `aria-hidden`，语义仍然只由文字承担——屏幕阅读器不该读出"三角形"。
+  '.dsh-dbg-warn{display:flex;align-items:flex-start;gap:6px;',
+  'color:var(--dsw-alias-state-warn-primary,#b45309)}',
+  '.dsh-dbg-warn .dsh-dbg-svg{flex:none;margin-top:2px}',
   '.dsh-dbg-error{color:var(--dsw-alias-state-error-primary,#b91c1c)}',
 ].join('')
 
@@ -228,7 +238,7 @@ function DebugPanel(props) {
    */
   const [foldOverride, setFoldOverride] = useState({ status: null, collapsed: false })
 
-  // 草稿：有未发送内容时禁用两个按钮，避免同一条描述被送两遍（§9.3.1）。
+  // 草稿：有未发送内容时禁用两个按钮，避免同一条描述被送两遍。
   // 这个条件在同一个座位上是稳定的（standardProps 不会中途增减），所以不算违反 hooks 规则。
   let draft = false
   if (typeof useInput === 'function') {
@@ -303,7 +313,7 @@ function DebugPanel(props) {
     title: collapsed ? '展开调试面板' : '收起调试面板',
     onClick: toggleCollapsed,
   },
-  createElement('span', { className: 'dsh-dbg-chev', key: 'chev' }, collapsed ? '▸' : '▾'),
+  createElement('span', { className: 'dsh-dbg-chev', key: 'chev' }, chevronSvg()),
   createElement('span', { className: 'dsh-dbg-title', key: 'title' }, '调试模式'),
   createElement('span', { className: 'dsh-dbg-sep', key: 'sep' }, '·'),
   createElement('span', { key: 'hash' }, `#${task.hash}`),
@@ -325,7 +335,7 @@ function DebugPanel(props) {
         createElement('div', { className: 'dsh-dbg-caption' }, '请按这个顺序复现：'),
         createElement('ol', { className: 'dsh-dbg-steps' },
           steps.map((step, index) => createElement('li', { key: `s${index}` }, step))),
-      ))
+))
     } else if (waiting) {
       // 没给步骤时不留白：说清"该做什么"，而不是让用户对着一个按钮发呆。
       body.push(createElement('div', { className: 'dsh-dbg-caption', key: 'nosteps' },
@@ -337,7 +347,7 @@ function DebugPanel(props) {
         draft
           ? '输入框里有未发送的内容 —— 直接发送即可，它会被当成「问题复现，继续排查」。'
           : '也可以不用按钮：直接在输入框里描述现象，同样算「还在」。',
-      ))
+))
       body.push(createElement('div', { className: 'dsh-dbg-actions', key: 'actions' },
         createElement('button', {
           type: 'button',
@@ -353,35 +363,35 @@ function DebugPanel(props) {
           disabled: Boolean(locked),
           onClick: () => decide('reproduce'),
         }, '问题复现，需要进一步修复'),
-      ))
+))
     } else if (task.status === 'awaiting-agent') {
-      // 收尾三态（§9.4）：用户永远该知道代码库被留下了什么。
+      // 收尾三态：用户永远该知道代码库被留下了什么。
       body.push(createElement('div', { className: 'dsh-dbg-hint', key: 'pending' },
         resolved
           ? '已通知 Agent 清理探针 —— 探针不摘干净就不算结束，收尾结果会出现在本轮回复里。'
           // 「复现」之后日志**保留**着：Agent 要先读它，读完、开下一轮时才清空。
           : '已通知 Agent。这一轮的日志保留着，等它读完再开下一轮。',
-      ))
+))
     } else {
       body.push(createElement('div', { className: 'dsh-dbg-hint', key: 'active' },
         task.status === 'active'
           ? 'Agent 正在改代码/埋点，等它交卷后这里会开放选择。'
           : statusLine(task.status, verdict),
-      ))
+))
     }
 
-    // ⚠️ 失效必须可见（§16.3.0 第 2 条）：闸门依赖"能写、能扫"，
+    // [!] 失效必须可见（第 2 条）：闸门依赖"能写、能扫"，
     // 缺了这个前提就绝不能让界面看起来还在保护着。
     if (task.detector && task.detector.available === false) {
-      body.push(createElement('div', { className: 'dsh-dbg-warn', key: 'detector' },
+      body.push(warnRow('detector', [
         '残留检测未生效：宿主无法完整扫描这个工作区，收尾时的"已清理干净"结论不可靠。',
         task.detector.writeProbeError
           ? createElement('span', { key: 'why' }, `（${task.detector.writeProbeError}）`)
           : null,
-      ))
+      ]))
     }
     for (const [index, note] of (task.notes ?? []).entries()) {
-      body.push(createElement('div', { className: 'dsh-dbg-warn', key: `note-${index}` }, note))
+      body.push(warnRow(`note-${index}`, [stripTextMarker(note)]))
     }
     if (failure) {
       body.push(createElement('div', { className: 'dsh-dbg-error', key: 'failure' },
@@ -406,16 +416,100 @@ function formatBytes(bytes) {
 }
 
 /**
+ * 折叠箭头：**内联 SVG**（一条折线，折起时朝右，展开时由 CSS 转 90°）。
+ *
+ * 为什么不用 `▸/▾` 这类字符：字形由字体决定，回退到哪个字体是平台的事——实测在等宽字体下
+ * 会渲染成方框。SVG 由我们自己画线，到哪都一样，而且不碰 emoji（AGENTS.md §4.4）。
+ */
+function chevronSvg() {
+  return createElement('svg', {
+    className: 'dsh-dbg-svg',
+    key: 'svg',
+    width: '10',
+    height: '10',
+    viewBox: '0 0 10 10',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  }, createElement('path', {
+    key: 'path',
+    d: 'M3.2 1.6 L6.8 5 L3.2 8.4',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: '1.6',
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  }))
+}
+
+/**
+ * 警告图标：**内联 SVG**（空心三角 + 感叹号）。
+ *
+ * 文本通道（工具返回值、指南、CLI）只能用 ASCII 的 `[!]`；面板是浏览器，就该用真正干净的图标。
+ * 图标本身 `aria-hidden`——语义由旁边的文字承担，屏幕阅读器不该读出"三角形"。
+ */
+function warnSvg() {
+  return createElement('svg', {
+    className: 'dsh-dbg-svg',
+    key: 'svg',
+    width: '12',
+    height: '12',
+    viewBox: '0 0 12 12',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  }, [
+    createElement('path', {
+      key: 'tri',
+      d: 'M6 1.4 L11.1 10.6 H0.9 Z',
+      fill: 'none',
+      stroke: 'currentColor',
+      strokeWidth: '1.2',
+      strokeLinejoin: 'round',
+    }),
+    createElement('path', {
+      key: 'bar',
+      d: 'M6 4.8 V7.3',
+      fill: 'none',
+      stroke: 'currentColor',
+      strokeWidth: '1.2',
+      strokeLinecap: 'round',
+    }),
+    createElement('path', {
+      key: 'dot',
+      d: 'M6 8.6 V9.1',
+      fill: 'none',
+      stroke: 'currentColor',
+      strokeWidth: '1.4',
+      strokeLinecap: 'round',
+    }),
+  ])
+}
+
+/** 面板上的一行警告：图标 + 正文。 */
+function warnRow(key, children) {
+  return createElement('div', { className: 'dsh-dbg-warn', key }, [warnSvg(), ...children.filter(Boolean)])
+}
+
+/**
+ * 去掉宿主文本里的 ASCII 标记前缀（`[!] `）。
+ *
+ * 宿主在**纯文本通道**（工具返回值、日志）里必须写出 `[!]`，因为那边没有图标可用；
+ * 而面板已经用 SVG 画了同一个语义，再把 `[!]` 印出来就是一句话说两遍。
+ */
+function stripTextMarker(text) {
+  return String(text ?? '').replace(/^\[!\]\s*/, '')
+}
+
+/**
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
 export function apply(ctx) {
   ensureStyles()
   // inject 是「声明感知」的：座位声明塌陷时注册随之释放、回来时重装。
-  // 绝不要裸调 ctx.slots.register —— 座位可能稍后才声明（见 DESIGN.md §9.1.3）。
+  // 绝不要裸调 ctx.slots.register —— 座位可能稍后才声明。
   ctx.slots.inject(SLOT_KEY, () =>
     ctx.slots.register(
       { name: SLOT_KEY, id: SLOT_ID, order: SLOT_ORDER, label: () => '调试模式' },
       (props) => createElement(DebugPanel, props),
-    ),
-  )
+),
+)
 }

@@ -4,6 +4,10 @@
  * 这三处有一个共同点：**它们的行为是模型看不到的**。命令返回错了指令，模型只会
  * 一头雾水；提示词段落没判空，没进调试模式的会话会被注入"去埋点"；路由返回错了
  * 状态码，面板按钮就静默失效。所以它们必须在没有浏览器、没有真实宿主的情况下可测。
+ *
+ * [!] 每处 `new DebugService(...)` 都注入自己的 `tempDir`（`createArtifactBase()`）：
+ * 产物默认落用户临时目录，而 `node --test` 并行跑多个测试文件——共用真实
+ * `%TEMP%/dsh-debug-mode` 会让恢复类断言撞上别的测试文件留下的任务。
  */
 
 import assert from 'node:assert/strict'
@@ -14,7 +18,7 @@ import { registerDebugCommand, COMMAND_NAME } from '../lib/command.js'
 import { ROUTE_PREFIX, registerRoutes } from '../lib/routes.js'
 import { DebugService } from '../lib/debug-service.js'
 import { debugCommandInstruction, debugGuidance } from '../lib/prompt.js'
-import { createAgent, createFakeContext, createWorkspace } from './helpers.mjs'
+import { createAgent, createArtifactBase, createFakeContext, createWorkspace } from './helpers.mjs'
 
 const SESSION = 'session-aaaa'
 
@@ -56,7 +60,16 @@ function fakeHttp({ method = 'GET', url = '/', body } = {}) {
       if (body !== undefined) listeners.get('data')?.(Buffer.from(JSON.stringify(body)))
       listeners.get('end')?.()
       await done
-      return { status: res.statusCode, json: res.payload ? JSON.parse(res.payload) : null, headers: res.headers }
+      const payload = res.payload
+      let json = null
+      try {
+        json = payload ? JSON.parse(payload) : null
+      } catch {
+        // `/stub.js` 返回的是 **JavaScript 源码**，不是 JSON。这里必须容忍纯文本——
+        // 严格 parse 会让"脚本内容"这条路一走就抛 SyntaxError（那是测试替身的锅，不是路由的）。
+        json = null
+      }
+      return { status: res.statusCode, json, payload, headers: res.headers }
     },
   }
 }
@@ -85,7 +98,7 @@ test('debugGuidance：无任务必须返回空串（否则没进调试的会话�
   assert.ok(withEndpoint.includes('probe.http.md'))
   assert.ok(withEndpoint.includes('deadbeef.log'))
 
-  // ★★ 本次修复的核心：**光是给一个拼好的 URL 不够**。
+  // (*)(*) 本次修复的核心：**光是给一个拼好的 URL 不够**。
   // 实测里 Agent 知道 origin（宿主把 Web GUI 地址写在它自己的系统提示里）、
   // 也知道哈希，却不知道中间那段**路由路径**，只能反问「这里的 <路径> 是什么」。
   // 所以路径形状必须在两种情况下都写得一清二楚。
@@ -122,8 +135,9 @@ test('debugGuidance：无任务必须返回空串（否则没进调试的会话�
 
 test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模型，所以必须主动投递）', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
   try {
     registerDebugCommand(fake.ctx, service)
     assert.equal(fake.commands.length, 1)
@@ -156,7 +170,7 @@ test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模
     assert.match(text, /点了保存列表不刷新/, '用户描述必须原样进这一轮（它是数据，不是指令）')
     assert.match(text, /dsh_debug_start/)
     assert.match(text, /不要调用 `dsh_debug_start`/, '必须告诉 Agent"一眼看出根因就别进调试"')
-    // ★ 本次修复的核心：不许再等用户补一句「开始」。
+    // (*) 本次修复的核心：不许再等用户补一句「开始」。
     assert.match(text, /这一轮就是完整的请求/, '必须明说这就是完整请求')
     assert.match(text, /不要等用户再说一句「开始」/)
 
@@ -166,7 +180,7 @@ test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模
 
     // 没写描述时也要开一轮：让 Agent 主动问，而不是卡住。
     const noText = createFakeContext({ cwd: workspace.root })
-    const service2 = new DebugService(noText.ctx, { logger: noText.ctx.logger })
+    const service2 = new DebugService(noText.ctx, { logger: noText.ctx.logger, tempDir: art.base })
     registerDebugCommand(noText.ctx, service2)
     const empty = await noText.commands[0].handler({
       agent: createAgent({ id: 'session-empty', cwd: workspace.root }),
@@ -185,17 +199,19 @@ test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模
     assert.equal(fake.prompts.length, 1, '被拒绝时不该投递任何东西')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('/debug 投递失败时必须如实说，并告诉用户"直接发描述就能继续"（票据已签好）', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
   // 宿主拒绝投递（比如会话正在关闭）。
   fake.ctx.sessionController.prompt = async () => {
     throw new Error('agent-busy')
   }
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
   try {
     registerDebugCommand(fake.ctx, service)
     const result = await fake.commands[0].handler({
@@ -211,6 +227,7 @@ test('/debug 投递失败时必须如实说，并告诉用户"直接发描述就
     assert.ok(ticket && ticket.text === '保存后列表不刷新')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
@@ -222,17 +239,21 @@ test('debugCommandInstruction 在用户没写描述时仍然可执行（不猜�
 
 test('路由：/state 无任务也要 200；缺参数 400；/resolve 未知 hash 404；非 POST 405', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
   try {
     registerRoutes(fake.ctx, service)
+    // 顺序即契约：`/probe` 在 `/stub.js` **之前**，两个用户信号在最后。
     assert.deepEqual(fake.routes.map((route) => route.path), [
       `${ROUTE_PREFIX}/state`,
       `${ROUTE_PREFIX}/board`,
       `${ROUTE_PREFIX}/probe`,
+      `${ROUTE_PREFIX}/stub.js`,
       `${ROUTE_PREFIX}/resolve`,
       `${ROUTE_PREFIX}/reproduce`,
     ])
+    assert.equal(fake.routes.length, 6, '浏览器桩让路由总数从 5 变成 6')
     assert.ok(fake.routes.every((route) => route.kind === 'exact'))
 
     const state = fake.routes.find((route) => route.path.endsWith('/state'))
@@ -263,13 +284,76 @@ test('路由：/state 无任务也要 200；缺参数 400；/resolve 未知 hash
     assert.equal((await badBody.deliver()).status, 400)
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('路由 GET /stub.js：活跃任务 200 + JS + 烘死的哈希与端点；未知 404；已关闭 409；非 GET 405', async () => {
+  const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
+  // 桩里要烘死一个**绝对摄入端点**，所以这里必须让宿主地址是已知的（端口 19387）。
+  // 同时把 `DSH_WEB_URL` 收起来：它是 endpointBase() 的第一来源，留着它这条断言
+  // 就会随"跑测试的机器有没有设这个变量"而飘。
+  const fake = createFakeContext({ cwd: workspace.root, webPort: 19387 })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
+  const previousWebUrl = process.env.DSH_WEB_URL
+  delete process.env.DSH_WEB_URL
+  try {
+    registerRoutes(fake.ctx, service)
+    await service.issueTicket({ sessionId: SESSION, text: 'x', workspace: workspace.root })
+    const started = await service.start({ sessionId: SESSION, goal: 'x', workspace: workspace.root })
+    assert.equal(started.ok, true, started.text)
+
+    const route = fake.routes.find((item) => item.path === `${ROUTE_PREFIX}/stub.js`)
+    assert.ok(route, '必须注册 /stub.js 路由')
+
+    // 这条路存在的理由：产物住在**用户临时目录**里，项目的 dev server 看不见那个文件，
+    // 页面唯一的引法就是让宿主即时渲染并伺服它。
+    const live = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/stub.js?h=${started.hash}` })
+    route.handler(live.req, live.res)
+    const liveResult = await live.deliver()
+    assert.equal(liveResult.status, 200)
+    assert.match(liveResult.headers['Content-Type'], /javascript/, '必须是脚本的 MIME，否则 <script src> 会被拒')
+    assert.equal(liveResult.headers['Cache-Control'], 'no-store', '换了任务就该立刻生效，不能被缓存骗到')
+    // 正文是**即时渲染**的：哈希与摄入端点都必须烘死在里面（不是读磁盘上的副本）。
+    assert.ok(String(liveResult.payload).includes(started.hash), '桩里必须烘死任务哈希')
+    assert.ok(String(liveResult.payload).includes(service.probeEndpoint(started.hash)),
+      '桩里必须烘死摄入端点（页面 file:// 下相对路径到不了宿主）')
+    assert.ok(!String(liveResult.payload).includes('__DSH_ENDPOINT__'), '锚点必须被替换')
+
+    const unknown = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/stub.js?h=ffffffff` })
+    route.handler(unknown.req, unknown.res)
+    assert.equal((await unknown.deliver()).status, 404, '未知哈希不能给出一份能用的桩')
+
+    const wrongMethod = fakeHttp({ method: 'POST', url: `${ROUTE_PREFIX}/stub.js?h=${started.hash}` })
+    route.handler(wrongMethod.req, wrongMethod.res)
+    assert.equal((await wrongMethod.deliver()).status, 405)
+
+    // 收尾之后同一个哈希必须**不再给出一份能用的桩**：`end` 把任务目录删了、也把它从
+    // 任务表里摘了，所以诚实的答案是 **404（"这个哈希不存在了"）**——而不是 409
+    // （"任务已结束"那条分支只在任务还在内存里、状态已是 closed 的瞬间成立）。
+    // 页面此时拿到的是脚本加载失败，控制台会响——那正是我们要的：它不该再往回发探针了。
+    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: 'ok' })
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+    await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    const closed = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/stub.js?h=${started.hash}` })
+    route.handler(closed.req, closed.res)
+    const closedResult = await closed.deliver()
+    assert.equal(closedResult.status, 404)
+    assert.match(closedResult.json.reason, /没有哈希/)
+  } finally {
+    if (previousWebUrl === undefined) delete process.env.DSH_WEB_URL
+    else process.env.DSH_WEB_URL = previousWebUrl
+    await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('路由：/reproduce 把用户选择变成 Agent 的下一轮输入（并保持幂等）', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
   try {
     registerRoutes(fake.ctx, service)
     await service.issueTicket({ sessionId: SESSION, text: 'x', workspace: workspace.root })
@@ -301,6 +385,7 @@ test('路由：/reproduce 把用户选择变成 Agent 的下一轮输入（并�
     assert.equal(fake.prompts.length, 1, '重复点击绝不能产生第二次 prompt')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
@@ -327,13 +412,20 @@ test('自检脚本能跑通并给出退出码 0（矩阵 / 不变量 / 三处一
   assert.ok(summary.parity.every((item) => item.ok), '三处实现出现了不一致')
 })
 
-test('apply 装配：一个命令 + 五条路由；每个 agent 拿到 5 个工具与一个"按需非空"的提示词段落', async () => {
+test('apply 装配：一个命令 + 六条路由；每个 agent 拿到 5 个工具与一个"按需非空"的提示词段落', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
+  // `apply(ctx)` 只接受 ctx（它自己没有 tempDir 参数），所以这里只能从**环境变量**
+  // 把产物根指到本次测试自己的目录里：`/debug` 签票会把票据落盘，让它掉进真实
+  // `%TEMP%/dsh-debug-mode` 就是给并行测试留一个"偶尔才红"的坑。
+  const previousTmp = process.env.DSH_DEBUG_MODE_TMP
+  process.env.DSH_DEBUG_MODE_TMP = art.base
   try {
     const service = apply(fake.ctx)
     assert.equal(fake.commands.length, 1)
-    assert.equal(fake.routes.length, 5)
+    // 6 = state / board / probe / stub.js / resolve / reproduce。
+    assert.equal(fake.routes.length, 6)
 
     // 装配时还没有 agent：既没有全局兜底注册，也没有凭空造段落。
     assert.equal(fake.toolRegistrations.length, 0)
@@ -356,7 +448,7 @@ test('apply 装配：一个命令 + 五条路由；每个 agent 拿到 5 个工�
     assert.equal(withTask.includes('deadbeef'), false)
     assert.match(withTask, /任务 [0-9a-f]{8}/, '任务活跃时必须真的给出准则')
 
-    // ★ 注入段是**唯一每轮都在**的文本，所以本任务的具体地址必须在里面。
+    // (*) 注入段是**唯一每轮都在**的文本，所以本任务的具体地址必须在里面。
     // 否则上下文一压缩，Agent 就变成"知道该用 HTTP 端点、却不知道地址"——
     // 实测事故就是它反问「摄入路径是什么」。
     assert.match(withTask, /本任务的地址/, '地址块必须在注入段里')
@@ -373,18 +465,22 @@ test('apply 装配：一个命令 + 五条路由；每个 agent 拿到 5 个工�
       assert.match(withTask, /POST <宿主地址>\/dsh-debug-mode\/probe\?h=/)
     }
 
-    // 会话事件 → 状态自动迁移（§9.3.2）。
+    // 会话事件 → 状态自动迁移。
     await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '交卷' })
     assert.equal(service.tasks.get(SESSION).status, 'awaiting-user')
     fake.emit('session/event', { header: { id: SESSION } }, { type: 'user/message' })
     assert.equal(service.tasks.get(SESSION).status, 'active')
   } finally {
+    if (previousTmp === undefined) delete process.env.DSH_DEBUG_MODE_TMP
+    else process.env.DSH_DEBUG_MODE_TMP = previousTmp
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('apply 在拿不到 agent 作用域时退化为一次全局注册，并且只退一次', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
   const injected = []
   fake.ctx.inject = (keys, callback) => {
@@ -392,6 +488,8 @@ test('apply 在拿不到 agent 作用域时退化为一次全局注册，并且�
     callback(fake.ctx)
     return () => undefined
   }
+  const previousTmp = process.env.DSH_DEBUG_MODE_TMP
+  process.env.DSH_DEBUG_MODE_TMP = art.base
   try {
     apply(fake.ctx)
     // 没有任何可挂载的 agent.ctx。
@@ -402,14 +500,18 @@ test('apply 在拿不到 agent 作用域时退化为一次全局注册，并且�
     assert.equal(fake.toolRegistrations.length, 5)
     assert.ok(fake.warnings.some((message) => /退化为全局注册/.test(message)), '降级必须说出来')
   } finally {
+    if (previousTmp === undefined) delete process.env.DSH_DEBUG_MODE_TMP
+    else process.env.DSH_DEBUG_MODE_TMP = previousTmp
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('reproduce 在任务已结束后返回 409（面板不会因为过期的 hash 反复失败）', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
   try {
     registerRoutes(fake.ctx, service)
     const result = await service.reproduce({ hash: 'deadbeef', sessionId: SESSION })
@@ -428,5 +530,6 @@ test('reproduce 在任务已结束后返回 409（面板不会因为过期的 ha
     assert.equal(tooEarly.code, 409)
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })

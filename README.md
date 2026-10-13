@@ -15,7 +15,8 @@ Debug 模式把这件事反过来：**先在代码里装仪表，再让现象自
 ```
 你：现象描述
  └─ Agent 分析 → 在可疑路径埋探针（每处都带可摘除标记）
-      └─ 探针把记录交给宿主，落进 <你的仓库>/.dsh/debug-mode/tasks/<hash>/<hash>.log
+      └─ 探针把记录交给宿主，落进 <用户临时目录>/dsh-debug-mode/tasks/<hash>/<hash>.log
+           （临时目录不可写时回退到 <你的仓库>/.dsh/debug-mode/，回退会在面板上明说）
            └─ 你复现一次
                 └─ Agent 通过「读取日志」拿到摘要（异常全量、分组计数、省略量显式）
                      └─ 面板弹出，你选：
@@ -68,6 +69,19 @@ Debug 模式把这件事反过来：**先在代码里装仪表，再让现象自
   `dsh-debug:temp`，改动用 `dsh-debug:change <hash>` 标记。收尾时**只删探针与临时块，
   绝不回滚你的修复**——整体 `git checkout` 回滚是被明令禁止的收尾方式。
 
+## 产物放在哪
+
+调试产物默认落**用户临时目录**（`os.tmpdir()/dsh-debug-mode/tasks/<hash>/`），
+和你的工作区分开——所以它不会跟着 `git status`、不会被编辑器索引、也不会被当成项目文件；
+**每次任务结束都随任务一起删除**。
+
+- 临时目录不可写时（只读沙箱、受限账号等）自动回退到 `<你的仓库>/.dsh/debug-mode/`，
+  并且**会显示提示**——回退同时写进任务的备注、待办清单与 `dsh_debug_start` 的返回正文，
+  不会让你事后发现"日志不见了"。
+- 环境变量 `DSH_DEBUG_MODE_TMP` 可以把临时根指到别处（工具参数 `tempDir` 优先级更高）。
+- 代价要说清楚：因为用的是**系统临时目录**，系统清理临时文件时，**在途任务**的产物可能
+  被删掉。那会让这个任务没法继续（日志没了、桩也没了），需要重新 `/debug` 开一个。
+
 ## 埋点入口：任何能发 HTTP 的语言都一样
 
 **写日志这件事只有宿主一份实现。** 探针不需要自己格式化时间戳、自己截断、自己数上限、
@@ -89,9 +103,9 @@ curl -s -X POST 'http://127.0.0.1:<DSH 端口>/dsh-debug-mode/probe?h=<hash>' \
 只有目标不在本机时（容器里、另一台机器上）才需要把 `127.0.0.1` 换成可达地址，
 **路径与哈希一个字都不要动**。
 
-`dsh_debug_start` 还会把**端点与哈希已经填好**的现成代码片段生成到
-`.dsh/debug-mode/tasks/<hash>/runtime/probe.http.md`，覆盖 curl / Python / Node /
-Ruby / Go / PHP / PowerShell / Java —— 复制粘贴就能用。
+`dsh_debug_start` 还会把**端点与哈希已经填好**的现成代码片段生成到任务目录下的
+`runtime/probe.http.md`（绝对路径在 `dsh_debug_start` 的返回里给出），覆盖 curl / Python /
+Node / Ruby / Go / PHP / PowerShell / Java —— 复制粘贴就能用。
 
 这条通道带来的两件事：
 
@@ -120,11 +134,17 @@ Ruby / Go / PHP / PowerShell / Java —— 复制粘贴就能用。
 所以你**不需要**为了调试去起一个本地服务器）：
 
 ```html
-<script src=".dsh/debug-mode/tasks/<hash>/runtime/probe.browser.js"></script>
+<script src="http://127.0.0.1:<DSH 端口>/dsh-debug-mode/stub.js?h=<hash>"></script>
 <script>
   dshProbe('buggy-demo.html:42:onclick', { list: todos.length })
 </script>
 ```
+
+桩由**宿主即时伺服**（`GET /dsh-debug-mode/stub.js?h=<hash>`），所以页面里没有一行指向
+某个本地文件——**经典 `<script src>` 不受 CORS 限制**，这条通道对 `file://` 打开的页面同样
+能用，你**不需要**为了调试去起一个本地服务器。若页面自己的 CSP 只允许 `'self'`，把宿主
+origin 加进 `script-src`，或者把落盘副本（`dsh_debug_start` 返回的
+`runtime/probe.browser.js`）的内容整段粘进页面里。
 
 记录会按**同一份行协议**落进任务日志（`task` 由宿主写死，字段序只有一处真相）。
 
@@ -187,16 +207,15 @@ total 在 items 为空时算成了 null
 
 ## 状态
 
-**v0.0.1 · M0–M6 + §16 的 R1–R6 + HTTP 探针通道全部落地，102 个测试全绿**：
+**v0.19 · M0–M6 + R1–R6 + HTTP 探针通道全部落地，全部测试全绿**：
 `/debug` 与票据闸门、5 个信号工具、日志管道与摘要、唤醒闭环、交互面板、收尾对账、
 防堆屎山机制（R1 工作区索引 + 窗口 diff、残留扫描与隔离区、停止规则、欠账看板）
 全部就位；浏览器/远程运行时的 HTTP 探针通道也已补齐，**整条流程不依赖任何命令**。
 
 唯一还没做的是**人在真实 GUI 里点一次面板**——那一步只有你能做。
-详见 [DESIGN.md](./DESIGN.md) §14 路线图与 §15 待验证清单（10 项里 9 项已闭合，
-核实依据都写在那一节）。
 
-先读 [DESIGN.md](./DESIGN.md)（设计冻结稿）与 [AGENTS.md](./AGENTS.md)（工程纪律）。
+先读 [CHANGELOG.md](./CHANGELOG.md)（只追加的变更记录）与
+[AGENTS.md](./AGENTS.md)（唯一权威入口：契约、纪律、被推翻的机制都在那儿）。
 
 ## 安装
 

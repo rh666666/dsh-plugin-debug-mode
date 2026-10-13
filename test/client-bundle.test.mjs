@@ -5,9 +5,9 @@
  *   1. `lib/client.js` 是一个合法的 Module Loader 注册脚本（`window.__ModuleLoader__.load`）；
  *   2. 它的工厂返回 `{ apply, inject }`，且 `inject` 含 `slots`；
  *   3. `apply(ctx)` 用**声明感知**的 `slots.inject` 注册到 `conversation.composer.dock`，
- *      而不是裸调 `register`（座位可能稍后才声明，裸调会静默丢面板）；
+ * 而不是裸调 `register`（座位可能稍后才声明，裸调会静默丢面板）；
  *   4. 面板在没有任务时渲染空，在 `awaiting-user` 时给出两个可用的按钮，
- *      且**输入框有未发送内容时按钮被禁用**（DESIGN.md §9.3.1 的竞态防护）。
+ * 且**输入框有未发送内容时按钮被禁用**（的竞态防护）。
  *
  * 产物在 `node:vm` 的沙箱里执行：给它一个假的 `window` 与 `require`，
  * 这正是宿主加载它时所处的环境形状。
@@ -29,7 +29,7 @@ const SRC = join(ROOT, 'src', 'client.js')
 const BUILD = join(ROOT, 'scripts', 'build-client.mjs')
 const NODE = process.execPath
 
-/** 座位 key：改这里就会同时提醒改测试与 DESIGN.md §9.1.3。 */
+/** 座位 key：改这里就会同时提醒改测试与。 */
 const SLOT_KEY = 'conversation.input.dock'
 const SLOT_ID = 'debug-mode-decision'
 
@@ -48,7 +48,7 @@ const react = {
    * @param {() => unknown} render 一次渲染调用
    * @param {number} [rounds] 允许的重渲染轮数
    * @param {(tree: unknown) => void} [after] 每轮渲染之后、settle 之前调用——
-   *   用来模拟"用户在面板上点了一下"：它触发的 setState 会让循环再跑一轮。
+   * 用来模拟"用户在面板上点了一下"：它触发的 setState 会让循环再跑一轮。
    * @returns {Promise<unknown>} 最后一次渲染的宿主树
    */
   async run(render, rounds = 3, after = null) {
@@ -222,7 +222,7 @@ test('apply(ctx) 用声明感知的 inject 注册到输入框**上方**的座位
   const { exportsObject } = await loadExports()
   const { injections, options } = mountPanel(exportsObject)
 
-  assert.equal(injections[0].seat, SLOT_KEY, `座位必须是 ${SLOT_KEY}（见 DESIGN.md §9.1.3）`)
+  assert.equal(injections[0].seat, SLOT_KEY, `座位必须是 ${SLOT_KEY}`)
   assert.equal(options.name, SLOT_KEY)
   assert.equal(SLOT_KEY, 'conversation.input.dock',
     '这张卡片必须在输入框**上方**：首方把 conversation.input.dock 在文档流里渲染在 inputBar 之前，'
@@ -297,7 +297,7 @@ function collectByType(node, type, out = []) {
   return out
 }
 
-test('awaiting-user 时给出两个可用按钮；有草稿时禁用（§9.3.1 竞态防护）', async () => {
+test('awaiting-user 时给出两个可用按钮；有草稿时禁用（竞态防护）', async () => {
   const { exportsObject } = await loadExports()
   const { panel } = mountPanel(exportsObject)
   const task = {
@@ -431,7 +431,7 @@ test('折叠：只有轮到用户时自动展开；头部可手动折叠/展开�
     assert.equal(expandedTree.props['data-collapsed'], 'false')
     assert.equal(collectActionButtons(expandedTree).length, 2)
 
-    // ④ awaiting-agent 两种收尾态：折叠态那一行也要能区分开（§9.4）。
+    // ④ awaiting-agent 两种收尾态：折叠态那一行也要能区分开。
     globalThis.fetch = async () => ({
       ok: true,
       json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'resolved' } }),
@@ -451,7 +451,7 @@ test('折叠：只有轮到用户时自动展开；头部可手动折叠/展开�
   }
 })
 
-test('两个按钮把用户的二选一 POST 回宿主（§6.2 的路由表）', async () => {
+test('两个按钮把用户的二选一 POST 回宿主（的路由表）', async () => {
   const { exportsObject } = await loadExports()
   const { panel } = mountPanel(exportsObject)
   const task = { hash: 'deadbeef', round: 1, status: 'awaiting-user' }

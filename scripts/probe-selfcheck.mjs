@@ -10,8 +10,10 @@
  * 两种模式：
  *   1. 本地（默认）：在临时工作区里直接驱动 `DebugService`，跑完整矩阵 +
  *      三处实现一致性 + 协议不变量。**不需要 DSH 在跑，也不需要端口。**
- *   2. `--endpoint <url>`：打**活的** DSH（验证路由 / CORS / 真实宿主），
- *      日志从 `--repo`（默认 cwd）的任务目录里读。
+ *   2. `--endpoint <url>`：打**活的** DSH（验证路由 / CORS / 真实宿主）。
+ *      日志绝对路径取自 `GET /probe` 那个 handshake 响应里的 `logPath`
+ *      （产物现在住在用户临时目录里，从 `--repo` 拼出来的路径不再可信）；
+ *      拿不到时才要求显式传 `--log <绝对路径>`。
  *
  * 退出码：任何一条不合格 ⇒ 1（可以直接接进 CI 或 pre-commit）。
  *
@@ -20,11 +22,12 @@
  *   node scripts/probe-selfcheck.mjs --keep            # 保留临时目录供人工查看
  *   node scripts/probe-selfcheck.mjs --json            # 机器可读
  *   node scripts/probe-selfcheck.mjs --endpoint 'http://127.0.0.1:19387/dsh-debug-mode/probe?h=<hash>'
+ *   node scripts/probe-selfcheck.mjs --endpoint '<url>' --log '<日志绝对路径>'   # handshake 没给 logPath 时
  */
 
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createContext, runInContext } from 'node:vm'
 
@@ -47,7 +50,7 @@ const MAX_LINE_BYTES = 8 * 1024
  *   · 小键很多时绕过字符串档位（降级必须同时限键数）
  *   · 长 probe 是分组计数的键，被砍会让两组悄悄合并；超长时还会走**骨架兜底**分支
  *
- * ⚠️ 每条用例的请求体必须 ≤ 64 KiB（HTTP 路由的上限，DESIGN §7.6.3）——
+ * [!] 每条用例的请求体必须 ≤ 64 KiB（HTTP 路由的上限）——
  * 否则活模式会 400、本地模式却通过，两种模式结论不一致（实测踩过：9000 个小键）。
  * 脚本启动时会自检这一点，矩阵写错了会直接指出来。
  */
@@ -73,11 +76,12 @@ const MATRIX = [
 
 /** 解析命令行。 */
 function parseArgs(argv) {
-  const options = { endpoint: '', repo: process.cwd(), keep: false, json: false }
+  const options = { endpoint: '', repo: process.cwd(), log: '', keep: false, json: false }
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index]
     if (token === '--endpoint') options.endpoint = argv[++index] ?? ''
     else if (token === '--repo') options.repo = resolve(argv[++index] ?? '.')
+    else if (token === '--log') options.log = resolve(argv[++index] ?? '.')
     else if (token === '--keep') options.keep = true
     else if (token === '--json') options.json = true
     else if (token === '--help' || token === '-h') options.help = true
@@ -91,7 +95,8 @@ const HELP = `探针边界自检
 
   --endpoint <url>  打活的 DSH（形如 http://127.0.0.1:<端口>/dsh-debug-mode/probe?h=<hash>）
                     省略时走本地模式：临时工作区 + 真实 DebugService，不需要 DSH 在跑
-  --repo <path>     被调试仓库的根（默认当前目录）；活模式用它找日志，也用于定位任务
+  --log <path>      活模式的日志绝对路径（**只在 GET /probe 没给出 logPath 时才需要**）
+  --repo <path>     被调试仓库的根（默认当前目录）；仅作为定位提示保留
   --keep            保留临时工作区，便于人工查看落盘原文
   --json            以 JSON 输出（供 CI 消费）
   -h, --help        显示这段说明
@@ -210,7 +215,7 @@ function runBlankDrill() {
       // 总行数与"每个缝都恰好"的版本**一模一样**。
       before: ['a = 1', pre, '', "probe('x')", post, 'b = 2', '', pre, "probe('y')", post, 'c = 3'],
       expect: ['a = 1', 'b = 2', '', 'c = 3'],
-      note: '⚠️ 行数相同、位置不同——只比行数会把这一条判成「全对」',
+      note: '[!] 行数相同、位置不同——只比行数会把这一条判成「全对」',
     },
   ]
 
@@ -236,13 +241,18 @@ function runBlankDrill() {
 async function runLocal(options) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-selfcheck-'))
   const ctx = fakeContext()
-  const service = new DebugService(ctx)
+  // 产物根指到本次自检自己的临时工作区：默认的 `os.tmpdir()/dsh-debug-mode` 是**共享**的，
+  // 别让一次自检在用户临时目录里留下任务（也免得扫到别人留下的任务）。
+  const service = new DebugService(ctx, { tempDir: root })
   await service.issueTicket({ sessionId: 'selfcheck', workspace: root })
   const started = await service.start({ sessionId: 'selfcheck', workspace: root, goal: '探针边界自检' })
   if (!started.ok) throw new Error(`无法创建任务：${started.text}`)
 
   const hash = started.hash
-  const logAbs = join(root, '.dsh', 'debug-mode', 'tasks', hash, `${hash}.log`)
+  // 日志绝对路径**只能用 start 的返回值**：产物根是运行时解析出来的
+  // （临时目录优先，不可写才回退工作区），手拼的那一份不再是真相。
+  const logAbs = started.logPath
+  const logDir = dirname(logAbs)
   const rows = []
   let dirtyBefore = 0
 
@@ -265,7 +275,7 @@ async function runLocal(options) {
   }
 
   const invariants = await checkInvariants(service, hash, logAbs)
-  const parity = await checkParity(service, hash, root, logAbs)
+  const parity = await checkParity(service, hash, logDir, logAbs)
   const blanks = runBlankDrill()
 
   const logInfo = await stat(logAbs)
@@ -273,6 +283,7 @@ async function runLocal(options) {
     mode: 'local',
     workspace: root,
     hash,
+    logPath: logAbs,
     logBytes: logInfo.size,
     rows,
     invariants,
@@ -286,7 +297,7 @@ async function runLocal(options) {
 /**
  * 协议不变量。
  *
- * ⚠️ 关于 `ts` 的**真实契约**（自检脚本第一版把它写错了，这里纠正）：
+ * [!] 关于 `ts` 的**真实契约**（自检脚本第一版把它写错了，这里纠正）：
  *   · 省略 `ts` ⇒ 宿主补**到达时刻**；
  *   · 提供 `ts` ⇒ **原样采纳**。
  * 第二条是必需的，不是漏洞：浏览器桩**批量发送**（200 ms 一批、卸载时冲刷），
@@ -340,10 +351,11 @@ async function checkInvariants(service, hash, logAbs) {
 }
 
 /** 三处实现一致性：宿主摄入 vs Node 桩 vs 浏览器桩，同一条负载必须产出同一行（除 ts）。 */
-async function checkParity(service, hash, root, hostLog) {
+async function checkParity(service, hash, logDir, hostLog) {
   const results = []
-  const stubPath = join(root, '.dsh', 'debug-mode', 'tasks', hash, 'runtime', 'probe.parity.mjs')
-  const stubLog = join(root, '.dsh', 'debug-mode', 'tasks', hash, 'parity.log')
+  // 两个辅助文件落在**任务目录里**（由宿主日志的绝对路径反推），所以它们随任务一起消失。
+  const stubPath = join(logDir, 'runtime', 'probe.parity.mjs')
+  const stubLog = join(logDir, 'parity.log')
   const { writeFile } = await import('node:fs/promises')
   await writeFile(stubPath, await renderProbeStub({ hash, logAbsolutePath: stubLog }), 'utf8')
   const { probe } = await import(pathToFileURL(stubPath).href)
@@ -397,11 +409,16 @@ async function runLive(options) {
   const url = new URL(options.endpoint)
   const hash = url.searchParams.get('h') ?? url.searchParams.get('task') ?? ''
   if (!/^[0-9a-f]{8}$/.test(hash)) throw new Error('端点 URL 里缺少合法的 h=<8 位十六进制> 参数')
-  const logAbs = join(options.repo, '.dsh', 'debug-mode', 'tasks', hash, `${hash}.log`)
 
-  // 先自检：GET 同一个地址。
+  // 先自检：GET 同一个地址。**日志路径从它的响应里取** —— 产物现在默认落在用户
+  // 临时目录里，从 `--repo` 拼 `.dsh/debug-mode/tasks/...` 只会指到一个不存在的文件，
+  // 而那种失败会伪装成"脏行 / 没有记录"，把人带去查错的方向。
   const handshake = await fetch(url, { headers: { accept: 'application/json' } })
   const handshakeBody = await handshake.json().catch(() => ({}))
+  const logAbs = handshakeBody.logPath || options.log
+  if (!logAbs) {
+    throw new Error('活模式：GET /probe 没给出 logPath，且未传 --log <绝对路径>')
+  }
 
   const rows = []
   let dirtyBefore = parseLog(await readFile(logAbs, 'utf8').catch(() => '')).dirtyLines
@@ -445,7 +462,8 @@ async function runLive(options) {
 
 function renderReport(summary) {
   const lines = []
-  const mark = (ok) => (ok ? '✅' : '❌')
+  // 终端 / CI 的编码与字形回退各不相同，所以报告里一律用 ASCII 标记（仓库禁 emoji）。
+  const mark = (ok) => (ok ? '[ok]' : '[x]')
   lines.push('')
   lines.push(`探针边界自检 · ${summary.mode === 'local' ? '本地（临时工作区 + 真实 DebugService）' : `活模式 ${summary.endpoint}`}`)
   lines.push(`任务 #${summary.hash}${summary.logBytes !== undefined ? ` · 日志 ${summary.logBytes} 字节` : ''}`)
@@ -467,7 +485,7 @@ function renderReport(summary) {
   if (failedRows.length > 0) {
     lines.push('')
     lines.push('   失败明细：')
-    for (const row of failedRows) for (const failure of row.failures) lines.push(`   ✗ ${row.label}：${failure}`)
+    for (const row of failedRows) for (const failure of row.failures) lines.push(`   [x] ${row.label}：${failure}`)
   }
 
   if (summary.invariants.length > 0) {
@@ -482,8 +500,8 @@ function renderReport(summary) {
     for (const item of summary.parity) {
       lines.push(`   ${mark(item.ok)} ${item.label}  ${item.detail}`)
       if (!item.ok) {
-        lines.push(`      宿主  ：${item.host}`)
-        lines.push(`      桩    ：${item.stub}`)
+        lines.push(`      宿主：${item.host}`)
+        lines.push(`      桩：${item.stub}`)
         lines.push(`      浏览器：${item.browser}`)
       }
     }
@@ -491,7 +509,7 @@ function renderReport(summary) {
 
   if (summary.blanks.length > 0) {
     lines.push('')
-    lines.push('④ 空白演练（摘除探针块时空行的去向 —— **按位置**看，不看行数；✅ = 行为与文档写的预期一致）')
+    lines.push('④ 空白演练（摘除探针块时空行的去向 —— **按位置**看，不看行数；[ok] = 行为与文档写的预期一致）')
     const show = (line) => (line.trim() === '' ? '␣' : line)
     for (const item of summary.blanks) {
       lines.push(`   ${mark(item.ok)} ${item.label}`)
@@ -510,8 +528,8 @@ function renderReport(summary) {
   ]
   lines.push('')
   lines.push(failures.length === 0
-    ? `✅ 全部通过（${summary.rows.length} 条用例${summary.parity.length ? ` + ${summary.parity.length} 条一致性` : ''}${summary.invariants.length ? ` + ${summary.invariants.length} 条不变量` : ''}${summary.blanks.length ? ` + ${summary.blanks.length} 条空白演练` : ''}）`
-    : `❌ ${failures.length} 项不合格——见上面的明细`)
+    ? `[ok] 全部通过（${summary.rows.length} 条用例${summary.parity.length ? ` + ${summary.parity.length} 条一致性` : ''}${summary.invariants.length ? ` + ${summary.invariants.length} 条不变量` : ''}${summary.blanks.length ? ` + ${summary.blanks.length} 条空白演练` : ''}）`
+    : `[x] ${failures.length} 项不合格——见上面的明细`)
   return lines.join('\n')
 }
 
@@ -536,7 +554,7 @@ try {
   else process.stdout.write(`${renderReport(summary)}\n`)
 
   if (summary.mode === 'local' && options.keep) {
-    process.stdout.write(`\n临时工作区保留在：${summary.workspace}\n（日志原文：${join(summary.workspace, '.dsh', 'debug-mode', 'tasks', summary.hash, `${summary.hash}.log`)}）\n`)
+    process.stdout.write(`\n临时工作区保留在：${summary.workspace}\n（日志原文：${summary.logPath}）\n`)
   }
 
   const failed = summary.rows.some((row) => row.failures.length > 0)

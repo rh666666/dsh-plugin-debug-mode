@@ -18,7 +18,7 @@ import { test } from 'node:test'
 
 import { DebugService } from '../lib/debug-service.js'
 import { registerTools, toolDefinitions } from '../lib/tools.js'
-import { createFakeContext, createWorkspace } from './helpers.mjs'
+import { createArtifactBase, createFakeContext, createWorkspace } from './helpers.mjs'
 
 /** 宿主支持的 JSON Schema 关键字（抄自 `@deepseek-ai/dsh-tools` 的 assertSupportedJsonSchema）。 */
 const CONSTRAINT_KEYWORDS = new Set([
@@ -110,17 +110,25 @@ test('五个工具的名字、必填字段与 schema 都在宿主支持的子集
   }
 })
 
-test('registerTools 在给定作用域注册全部五个工具', () => {
+test('registerTools 在给定作用域注册全部五个工具', async () => {
+  const art = await createArtifactBase()
   const fake = createFakeContext()
-  const disposers = registerTools(fake.ctx, new DebugService(fake.ctx, { logger: fake.ctx.logger }))
-  assert.equal(disposers.length, 5)
-  assert.equal(fake.toolRegistrations.length, 5)
+  try {
+    const disposers = registerTools(fake.ctx, new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base }))
+    assert.equal(disposers.length, 5)
+    assert.equal(fake.toolRegistrations.length, 5)
+  } finally {
+    await art.cleanup()
+  }
 })
 
 test('每个工具的返回值都通得过自己的 output.schema（否则宿主会变成 ToolOutputError）', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
+  // 产物根必须指到本次测试自己的目录：`node --test` 并行跑多个测试文件，
+  // 共用真实 `%TEMP%/dsh-debug-mode` 会让"跨重启恢复"这类断言互相污染。
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
   const definitions = Object.fromEntries(toolDefinitions(service).map((tool) => [tool.name, tool]))
 
   /** 造一个"活的"执行上下文。 */
@@ -155,20 +163,26 @@ test('每个工具的返回值都通得过自己的 output.schema（否则宿主
     validateValue(definitions.dsh_debug_continue.output.schema, continued, 'continue')
   } finally {
     await workspace.cleanup()
+    await art.cleanup()
   }
 })
 
 test('工具在缺少 args / 缺少 agent 时给出可读返回值而不是抛异常', async () => {
+  const art = await createArtifactBase()
   const fake = createFakeContext()
-  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger })
-  const definitions = toolDefinitions(service)
+  try {
+    const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
+    const definitions = toolDefinitions(service)
 
-  for (const tool of definitions) {
-    // args 是任意值（原始注册不做参数校验）。
-    for (const args of [undefined, null, 'nonsense', 42, []]) {
-      const value = await tool.execute(args, {})
-      assert.equal(value.ok, false)
-      assert.match(value.text, /exec\.agent/)
+    for (const tool of definitions) {
+      // args 是任意值（原始注册不做参数校验）。
+      for (const args of [undefined, null, 'nonsense', 42, []]) {
+        const value = await tool.execute(args, {})
+        assert.equal(value.ok, false)
+        assert.match(value.text, /exec\.agent/)
+      }
     }
+  } finally {
+    await art.cleanup()
   }
 })

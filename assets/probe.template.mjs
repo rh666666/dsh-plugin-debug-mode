@@ -5,22 +5,24 @@
  * 追加写到本次调试任务的日志文件。
  *
  * 生命周期：
- *   1. `dsh_debug_start` 时，宿主把本文件复制到
- *      `<repo>/.dsh/debug-mode/tasks/<hash>/runtime/probe.mjs`，
- *      并把下方 `TASK` / `LOG` 两个常量替换成本次任务的真实值。
- *   2. Agent 在业务代码里 `import { probe } from '<repo>/.dsh/debug-mode/tasks/<hash>/runtime/probe.mjs'`
- *      然后调用它。
+ *   1. `dsh_debug_start` 时，宿主把本文件生成到**任务产物目录**的 `runtime/probe.mjs`
+ *      （默认在**用户临时目录** `<os.tmpdir()>/dsh-debug-mode/tasks/<hash>/`，
+ * 临时根不可写时才回退到 `<repo>/.dsh/debug-mode/tasks/<hash>/`），
+ * 并把下方 `TASK` / `LOG` 两个常量替换成本次任务的真实值。
+ *   2. Agent 在业务代码里 `import { probe } from 'file:///…/runtime/probe.mjs'`
+ *      （宿主给出的 `{{PROBE_IMPORT}}` 就是这个形式；Windows 的裸盘符路径
+ *      `D:\...` 不是合法的 ESM 说明符，必须走 `file:///`），然后调用它。
  *   3. `dsh_debug_end` / 用户选择「问题已解决」后，宿主连任务目录一起删除。
  *
- * 硬约束（改本文件前先读 DESIGN.md §7.4）：
+ * 硬约束（改本文件前先）：
  *   · 零依赖：只用 node: 内置模块，不 import 本插件的任何文件。
  *   · 永不抛异常：可观测性代码不许把被调试程序搞挂，任何失败都安静降级。
  *   · 同步追加写：崩溃前最后几条日志必须已经落盘（异步队列会吞掉现场）。
  *   · 不持有 fd：每次调用 open→write→close，保证宿主删文件后不复活它。
  *   · 单行长度上限 8 KiB，超长截断并标注 `truncated`。
- *   · 单任务日志总量上限 16 MiB（DESIGN.md §11.2）：到顶后**停止追加**并只写一条
+ *   · 单任务日志总量上限 16 MiB：到顶后**停止追加**并只写一条
  *     `probe: "debug-mode:overflow"`。为什么要停：一个跑飞的循环能在几分钟内把
- *     磁盘写满，而那种日志读起来也没有任何信息量——停写比写满更有用。
+ * 磁盘写满，而那种日志读起来也没有任何信息量——停写比写满更有用。
  */
 
 // ── 由宿主在生成时替换（保持本行格式，替换脚本按前缀匹配）────────────────────
@@ -37,14 +39,14 @@ const MAX_LINE = 8 * 1024
 /**
  * 超限降级档位：逐步收紧"单个字符串值允许保留多少字符"。
  *
- * ⚠️ 与 `lib/protocol.js` 的 `DEGRADE_STEPS` / `DEGRADE_MAX_ITEMS` / `DEGRADE_MAX_DEPTH`
+ * [!] 与 `lib/protocol.js` 的 `DEGRADE_STEPS` / `DEGRADE_MAX_ITEMS` / `DEGRADE_MAX_DEPTH`
  * 必须**逐字一致**（`test/protocol.test.mjs` 会喂同一批负载给三处实现并比对字节）。
  * 为什么不能切序列化好的整行：那会切出半个 JSON，读端只能算脏行（见 protocol.js 的长注释）。
  */
 const DEGRADE_STEPS = [2048, 512, 128, 16, 0]
 const DEGRADE_MAX_ITEMS = 50
 const DEGRADE_MAX_DEPTH = 6
-/** 单任务日志总字节上限，与 DESIGN.md §11.2 的表格一致。 */
+/** 单任务日志总字节上限，与 的表格一致。 */
 const MAX_BYTES = 16 * 1024 * 1024
 
 let ready = false
@@ -236,7 +238,7 @@ function parses(line) {
 
 /**
  * 写一条探针记录。
- * @param {string} probe  探针标识，推荐 `<相对文件路径>:<行号>:<短标签>`
+ * @param {string} probe 探针标识，推荐 `<相对文件路径>:<行号>:<短标签>`
  * @param {unknown} [data] 负载；建议传对象而不是裸字符串
  * @param {{ level?: string, msg?: string }} [options]
  */
@@ -290,7 +292,7 @@ export function probeScope(id, fn) {
       return result.then(
         (value) => { probe(`${id}:ok`, undefined, { level: 'debug' }); return value },
         (error) => { probe(`${id}:throw`, error, { level: 'error' }); throw error },
-      )
+)
     }
     probe(`${id}:ok`, undefined, { level: 'debug' })
     return result

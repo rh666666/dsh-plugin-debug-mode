@@ -1,5 +1,5 @@
 /**
- * test/summary.test.mjs —— `dsh_debug_read` 输出形状的守卫（DESIGN.md §8）。
+ * test/summary.test.mjs —— `dsh_debug_read` 输出形状的守卫。
  *
  * 四条契约，每一条都对应一种"Agent 被误导"的真实后果：
  *   1. warn/error 全量 —— 被 limit 裁掉的那条可能正是根因；
@@ -19,7 +19,7 @@ function logText(records) {
   return records.map((record) => formatRecord(record).trimEnd()).join('\n')
 }
 
-test('两种"看不见完整值"必须长得不一样：⚠️截断（真的被省略）vs 显示省略（日志里完整）', () => {
+test('两种"看不见完整值"必须长得不一样：[!]截断（真的被省略）vs 显示省略（日志里完整）', () => {
   const big = 'x'.repeat(1000)
   const text = renderLogSummary({
     hash: 'deadbeef',
@@ -32,7 +32,7 @@ test('两种"看不见完整值"必须长得不一样：⚠️截断（真的被
       JSON.stringify({ ts: '2026-10-10T10:00:01.000+08:00', task: 'deadbeef', probe: 'b:2', level: 'info', data: { v: big } }),
     ].join('\n'),
   })
-  assert.match(text, /⚠️截断/, '真的被省略的必须点名')
+  assert.match(text, /\[!\]截断/, '真的被省略的必须点名')
   assert.match(text, /显示省略/, '只是显示缩短的必须说清"日志里是完整的"')
   assert.match(text, /日志里是完整的/)
   // 关键回归守卫：两者不能都只呈现为一个 `…`（那正是害人查一轮的歧义）。
@@ -41,8 +41,8 @@ test('两种"看不见完整值"必须长得不一样：⚠️截断（真的被
   const truncatedLine = timeline.find((line) => line.includes('a:1'))
   const completeLine = timeline.find((line) => line.includes('b:2'))
   assert.ok(truncatedLine && completeLine, '两条都该出现在时间序里')
-  assert.match(truncatedLine, /⚠️截断/)
-  assert.ok(!/⚠️截断/.test(completeLine), '没被降级的记录不许被标成截断')
+  assert.match(truncatedLine, /\[!\]截断/)
+  assert.ok(!/\[!\]截断/.test(completeLine), '没被降级的记录不许被标成截断')
   assert.match(completeLine, /显示省略/, '完整记录要说明是显示层缩短')
 })
 

@@ -4,7 +4,7 @@
  * 为什么需要这一步：宿主对客户端半**不做任何编译**，它把每个 `client.js` 的字节
  * 原样拼接下发。所以 `lib/client.js` 必须已经是一个
  * `window.__ModuleLoader__.load({ id, factory })` 注册脚本，`import`/`export` 直接
- * 上线必死。详见 DESIGN.md §9.1。
+ * 上线必死。详。
  *
  * 为什么不用 esbuild/rollup：客户端半只有一两个文件，而引入打包器会带来
  * node_modules、锁文件与版本漂移——本项目的工程纪律是零运行时依赖（AGENTS.md §4.1）。
@@ -21,7 +21,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SRC = join(ROOT, 'src', 'client.js')
 const OUT = join(ROOT, 'lib', 'client.js')
 
-/** 工厂 id 必须逐字等于包名（宿主按包名登记，见 DESIGN.md §9.1.2）。 */
+/** 工厂 id 必须逐字等于包名（宿主按包名登记，）。 */
 const PACKAGE_NAME = 'dsh-plugin-debug-mode'
 
 /**
@@ -62,7 +62,7 @@ function rewriteImports(source) {
       fail(
         `不允许的导入 '${specifier}'。factory 只能 require 平台种子表里的模块：\n  `
         + PLATFORM_MODULES.join('\n  '),
-      )
+)
     }
     names.add(specifier)
     return `const ${clause.trim()} = require(${JSON.stringify(specifier)});`

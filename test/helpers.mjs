@@ -133,6 +133,29 @@ export async function createWorkspace(files = {}) {
   }
 }
 
+/**
+ * 造一个**产物根父目录**（不会被别的东西碰到的 tempBase）。
+ *
+ * 为什么每个测试都要有自己的：产物根现在默认落在用户临时目录里
+ * （`<tempBase>/dsh-debug-mode`），而 `node --test` 会**并行**跑多个测试文件——
+ * 共用一个 `%TEMP%/dsh-debug-mode` 会让 `debtBoard` / 跨重启恢复这类
+ * 「扫一遍所有任务目录」的断言互相污染（甲的任务出现在乙的看板上）。
+ *
+ * `root` 只是方便断言，**不预先创建**：「临时根写不进去」这条路要靠"同名文件占位"
+ * 来复现，预创建反而会把那条路堵死。
+ * @returns {Promise<{ base: string, root: string, cleanup: () => Promise<void> }>}
+ */
+export async function createArtifactBase() {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-artifacts-'))
+  return {
+    base,
+    root: join(base, 'dsh-debug-mode'),
+    async cleanup() {
+      await rm(base, { recursive: true, force: true })
+    },
+  }
+}
+
 /** 读文件；不存在返回 null。 */
 export async function readIfExists(absolute) {
   const { readFile } = await import('node:fs/promises')
