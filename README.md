@@ -1,5 +1,7 @@
 # dsh-plugin-debug-mode
 
+`github:rh666666/dsh-plugin-debug-mode` · <https://github.com/rh666666/dsh-plugin-debug-mode>
+
 > DSH（DeepSeek Harness）插件：**Cursor Agent 式的 Debug 模式**。
 > 让 Agent 别猜——它自己在你的代码里埋探针，把现场取回来；你复现一次，然后二选一。
 
@@ -185,7 +187,7 @@ total 在 items 为空时算成了 null
 
 ## 状态
 
-**v0.0.1 · M0–M6 + §16 的 R1–R6 + HTTP 探针通道全部落地，77 个测试全绿**：
+**v0.0.1 · M0–M6 + §16 的 R1–R6 + HTTP 探针通道全部落地，102 个测试全绿**：
 `/debug` 与票据闸门、5 个信号工具、日志管道与摘要、唤醒闭环、交互面板、收尾对账、
 防堆屎山机制（R1 工作区索引 + 窗口 diff、残留扫描与隔离区、停止规则、欠账看板）
 全部就位；浏览器/远程运行时的 HTTP 探针通道也已补齐，**整条流程不依赖任何命令**。
@@ -198,15 +200,31 @@ total 在 items 为空时算成了 null
 
 ## 安装
 
-```bash
-# npm 安装（发布后）
-dsh plugin --profile web add dsh-plugin-debug-mode
+**从 GitHub 直装**（仓库已推送；npm 上目前还没有这个包名）：
 
-# 本地开发
-dsh plugin --profile web add link:<本目录绝对路径>
+```bash
+dsh plugin --profile web add github:rh666666/dsh-plugin-debug-mode
 ```
 
-安装后在任意会话里敲 `/debug <现象描述>` 即可——命令会自动出现在宿主的命令面板里。
+另一种写法（标准 git 规范，不依赖 `github:` 简写）：
+
+```bash
+dsh plugin --profile web add git+https://github.com/rh666666/dsh-plugin-debug-mode.git
+```
+
+GitHub 拉不动时，克隆到本地再挂载：
+
+```bash
+git clone https://github.com/rh666666/dsh-plugin-debug-mode.git
+dsh plugin --profile web add link:<克隆下来的目录绝对路径>
+```
+
+**安装期不需要构建，也不需要 `node_modules`**：本插件零运行时依赖，而且
+`lib/client.js` 是**提交进 git 的生成物**——仓库里已经带着它，所以 git 直装与
+`link:` 本地挂载拿到的东西是一样的，不必先跑构建脚本（只有你改了 `src/client.js`
+才需要重跑 `scripts/build-client.mjs`，见下面的「开发」）。
+
+装完在任意会话里敲 `/debug <现象描述>` 即可——命令会自动出现在宿主的命令面板里。
 
 ## 开发
 
