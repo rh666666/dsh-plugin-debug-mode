@@ -454,6 +454,45 @@ test('S5/S7：未经用户表态 end 被拒；resolve 幂等只唤醒一次；en
   }
 })
 
+test('chip 上的叉 = 「问题已解决」，但它不受 awaiting-user 约束（进了调试就出不来的修复点）', async () => {
+  const { service, fake, workspace, art } = await setup()
+  try {
+    // `active` —— Agent 正在排查、还没交卷。这时面板上根本没有按钮可点。
+    const started = await startTask(service, workspace)
+    assert.equal(service.tasks.get(SESSION).status, 'active')
+
+    // ① 面板那条路（不带 anytime）在 active 上仍然被拒：窗口语义没有被这条新通道放松。
+    const panelWay = await service.resolve({ hash: started.hash, sessionId: SESSION })
+    assert.equal(panelWay.ok, false)
+    assert.equal(panelWay.code, 409)
+    assert.match(panelWay.text, /不在"等用户下结论"的窗口里/)
+    assert.equal(fake.prompts.length, 0, '被拒的表态不得唤醒 Agent')
+
+    // ② chip 那条路（anytime）在 active 上直接成立：同一个 resolved 表态，只是不排队等。
+    const chipWay = await service.resolve({ hash: started.hash, sessionId: SESSION, anytime: true })
+    assert.equal(chipWay.ok, true, chipWay.text)
+    assert.equal(chipWay.status, 'awaiting-agent')
+    assert.equal(service.tasks.get(SESSION).userVerdict, 'resolved')
+    assert.equal(fake.prompts.length, 1, '表态必须唤醒 Agent 去收尾')
+    assert.match(fake.prompts[0].content[0].text, /问题已解决/)
+    // 用户跳过了"复现 → 表态"那个窗口，所以这一轮必须明确禁止假装验证过。
+    assert.match(fake.prompts[0].content[0].text, /verified/)
+    assert.match(fake.prompts[0].content[0].text, /假装验证过/)
+
+    // ③ 幂等：叉连点两次只唤醒一次。
+    const again = await service.resolve({ hash: started.hash, sessionId: SESSION, anytime: true })
+    assert.equal(again.duplicate, true)
+    assert.equal(fake.prompts.length, 1)
+
+    // ④ 收尾照旧走 dsh_debug_end 那道门——叉给的就是 resolved，所以门是开的。
+    const ended = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(ended.ok, true, ended.text)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
 test('隔离区：hash 不属于任何已知任务时，end 暂停并要求用户逐条决定（不允许静默保留）', async () => {
   const { service, workspace, art } = await setup({
     'src/foreign.js': 'const x = 1 // dsh-debug:probe 0011aabb start\nconst y = 2\n',

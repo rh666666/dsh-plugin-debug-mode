@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-debug-mode",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "DSH 插件的 Cursor-Agent 式 Debug 模式：以固定探针日志协议驱动 Agent 在代码库中主动埋点，把日志落到用户临时目录（不可写时回退 .dsh/debug-mode/），调试结束后由用户在弹出的面板中选择「问题已解决」或「问题复现，需要进一步修复」。",
   "keywords": [
     "dsh",

@@ -105,7 +105,7 @@
 
 | 文件 | 内容 |
 | --- | --- |
-| [CHANGELOG.md](./CHANGELOG.md) | 只追加的变更记录（**版本号纪律见 §4.6**）：最新版本 v0.19，行序新→旧、版本号连续无缺口 |
+| [CHANGELOG.md](./CHANGELOG.md) | 只追加的变更记录（**版本号纪律见 §4.6**）：最新版本 v0.20，行序新→旧、版本号连续无缺口 |
 | [package.json](./package.json) | 包清单：`dsh.bundle.patch` + `dsh.client` 双挂载声明 |
 | [cordis.patch.yml](./cordis.patch.yml) | bundle 挂载声明（插入 `debug-mode` 行） |
 | [lib/protocol.js](./lib/protocol.js) | 日志行协议的唯一真相：`formatRecord` / `parseRecord` / `parseLog` |
@@ -122,7 +122,7 @@
 | [assets/probe.template.mjs](./assets/probe.template.mjs) | 零依赖 Node 探针桩模板（生成到任务产物根的 `runtime/probe.mjs`；烘死 TASK/LOG；16 MiB 上限） |
 | [assets/probe.browser.js](./assets/probe.browser.js) | 零依赖**浏览器**探针桩模板（经典脚本，`dshProbe` → HTTP 摄入；批量 + 卸载冲刷）；页面用 `<script src="http://127.0.0.1:<端口>/dsh-debug-mode/stub.js?h=<hash>">` 引它，不必让页面去读文件系统 |
 | [assets/AGENT-PROBE-GUIDE.md](./assets/AGENT-PROBE-GUIDE.md) | 回给 Agent 的埋点指南模板（含 `{{HASH}}` 等变量；§零「不要运行任何命令」、§五 HTTP 统一入口、§六 文件桩是最后手段） |
-| [src/client.js](./src/client.js) | 浏览器半**源码**：输入框上方的可折叠卡片 + 三态渲染 + 按钮接线 + 草稿协调 + 样式令牌 |
+| [src/client.js](./src/client.js) | 浏览器半**源码**：输入框上方的可折叠卡片 + **工具行里的状态 tag（chip，带叉）** + 三态渲染 + 按钮接线 + 草稿协调 + 样式令牌 |
 | [scripts/build-client.mjs](./scripts/build-client.mjs) | 把源码包成 `__ModuleLoader__` 产物（零第三方依赖） |
 | [scripts/probe-selfcheck.mjs](./scripts/probe-selfcheck.mjs) | **探针边界自检**：边界矩阵 + 协议不变量 + 三处实现一致性；本地/活两种模式；退出码可进 CI |
 | [lib/client.js](./lib/client.js) | 【生成物】客户端产物，勿手改 |
@@ -272,8 +272,9 @@ DSH 有两条互不相通的客户端通道，API 名一样、能力完全不同
 1. **只写 `src/client.js`，不碰 `lib/client.js`**（后者是生成物，会被覆盖）。
 2. 产物必须带 `window.__ModuleLoader__.load({ id, factory })` 外壳，`id` 逐字等于包名；
    宿主不做编译，直接原样下发，所以 ESM 语法上线必白屏。构建脚本负责套壳。
-3. 面板座位只注册一次却服务**所有会话**——必须按 `sessionId` 自过滤，无关时
-   `return null`；**绝不要**在模块级放「当前任务」这类全局状态。
+3. 客户端半现在坐**两个座位**，都只注册一次却服务**所有会话**——必须按 `sessionId`
+   自过滤，无关时 `return null`；**绝不要**在模块级放「当前任务」这类全局状态。
+   座位本身的事实（`kind` / `scope` / occupants）见 §6 那两条。
 
 ### 4.4 代码风格
 
@@ -474,14 +475,41 @@ no-op，实测因此丢过两行版本记录）；验证表格要数"每行有�
   `SECTION_ORDERS`（本插件用 `TOOLS_SDK=5000` 之后的 **5050**）。
 - 客户端入口是 `exports["./client"].default`（不是 `main`），且产物**必须**是
   `window.__ModuleLoader__.load({ id, factory })` 脚本——宿主不做编译（§4.3）。
-- 面板座位是 **`conversation.input.dock`**（list / session 作用域，**输入框卡片正上方**），
-  用 `ctx.slots.inject`（声明感知）注册。**不要**用 `conversation.composer.dock`：
-  那个渲染在卡片**下方**，会把输入框往上挤（实测反馈原话是「挤兑了原有的提示词输入框的位置」）。
-  首方在 `composerStack` 里把 `input.dock` 渲染在 `inputBar` **之前**，所以它贴近输入框、
-  不会挪动它、也**不可能遮挡**它——那是文档流兄弟节点，不是 overlay
-  （`conversation.input.overlay` 才是浮在卡片里的那个，绝对不能用）。
-  该座位给到 `useInput`，面板因此能看见用户正在打什么，从而避免
+- 客户端半坐**两个座位**，两个都用 `ctx.slots.inject`（声明感知）注册。
+  ① **`conversation.input.dock`**（list / session，**输入框卡片正上方**）= 那张可折叠面板卡片；
+  ② **`conversation.input.left`**（list / session，**输入框工具行左侧**、`+` / 回形针之后）
+  = 状态 tag（chip）。
+  两者都**不要**换成 `conversation.composer.dock`：它渲染在卡片**下方**，会把输入框往上挤
+  （用户实测原话是「挤兑了原有的提示词输入框的位置」）。首方在 `composerStack` 里把
+  `input.dock` 渲染在 `inputBar` **之前**，所以它贴近输入框、不会挪动它、也**不可能遮挡**它
+  ——那是文档流兄弟节点，不是 overlay（`conversation.input.overlay` 才是浮在卡片里的那个）。
+  `input.dock` 给到 `useInput`，面板因此能看见用户正在打什么，从而避免
   「打了半句又顺手点按钮 ⇒ 同一条描述送两遍」的竞态。
+- **`kind: "single"` 的座位不能占——注册会抛错，抛在装配期，后果是整个应用起不来**。
+  首方那一行 chip（Plan / 权限 / 模型 / 活动）所在的 `conversation.input.plan` 等座位是
+  **单占用**的，而 `SlotCore.register` 对它的判据是**抛错**而不是"后来者顶掉前者"：
+  `case "single": { const m = i.entries.find(g => (g.options.priority ?? 0) === c); if (m) throw … }`
+  （依据：`@deepseek-ai/dsh-web-frontend` 的 `SlotCore`）。装配是**同步**的（`apply` 里就注册），
+  所以第二个注册者当场抛错、它的 entry 起不来，web boot 的 `assertEntriesActive` 断言
+  「N entry did not activate」⇒ **启动即崩，与有没有活跃任务无关**。推论三条：
+  ① 单占用座位上的冲突是**装配期错误**，不是观感取舍——"两个模式不共存所以可以抢"这个理由
+     **不成立**：不共存的是**运行时**，抛错发生在**装配期**；
+  ② inspect provider 的 `replaceRisk: "shadows-shipped-ui"` 只说"会遮住首方 UI"，
+     **没**说到"会抛错、会崩"。判断一格能不能占，看 `kind` / `scope` / 当前 `occupants`，
+     别只读 `purpose` 描述。`list` 座位按 `id` 去重、天然可共存；`single` 一定不能碰；
+  ③ 想和别人的 chip 并排，正确做法是**换一个 list 座位**（或请首方把那一格改成 list），
+     不是在 single 座位上换 priority——换 priority 只会让崩溃从对方转到自己身上。
+  回归守卫：`test/client-bundle.test.mjs` 里那条用 SlotCore 判据做的替身测试。
+- **状态 tag（chip）上的叉 = 「问题已解决」这个表态本身**（v0.20）：它 POST
+  `/dsh-debug-mode/resolve`，但多带一个 `anytime: true`，于是**不受**
+  `awaiting-user` 那道门约束——面板按钮仍保持窗口语义（`anytime` 只对 `resolved` 生效，
+  任务存在 / 属于本会话 / 未关闭三条校验一条不少，幂等照旧）。
+  为什么必须有它：两道门叠起来（S5 要求 `awaiting-user` + `dsh_debug_end` 要求
+  `userVerdict === 'resolved'`）会让用户**进了调试就出不来**（实测反馈原话）。
+  实现上注意两点：① `anytime` 那条路的状态迁移走**两步**
+  （`active → awaiting-user → awaiting-agent`）——`lib/task.js` 的 `TRANSITIONS` 里
+  `active` 只能去 `awaiting-user` / `closed`，非法迁移是抛错而不是兜底；
+  ② 这一轮给 Agent 的指令必须点明"用户可能没走完整复现流程，**不要假装验证过**"。
 - 面板**默认折叠**，只在 `awaiting-user` 自动展开；折叠态的那一行必须自己说清"轮到谁"。
   这是"不占输入框地方"的另一半——只在上面是不够的。
 - 面板内容只有两样：`dsh_debug_report` 的 **`headline`**（一句话结论）与
@@ -538,6 +566,7 @@ no-op，实测因此丢过两行版本记录）；验证表格要数"每行有�
 | **`host.call(...)`** | 包通道（`dsh.client`）里**根本没有这个 API**，它是动态通道的；照着写只会拿到 undefined。包通道里回宿主只有一条路：`ctx.webServer.register(...)` 路由 + 浏览器 `fetch` |
 | **手写 ESM 客户端半** | 宿主不做编译，客户端产物按字节拼接后原样下发，所以 `import`/`export` 上线必白屏。必须打成 `window.__ModuleLoader__.load({ id, factory })` 产物，`id` 逐字等于包名 |
 | **面板座位 `conversation.composer.dock`** | 它渲染在输入框卡片**下方**，会把输入框往上挤（用户实测原话：「挤兑了原有的提示词输入框的位置」）。`conversation.input.dock` 是文档流里 `inputBar` 之前的兄弟节点，贴近而不挪动、也不可能遮挡 |
+| **状态 tag 坐 `conversation.input.plan`**（首方 Plan chip 那一格，为了"和它一样"） | **代价是启动崩溃，不是观感差异。** 那是 `kind: "single"` 座位，`SlotCore.register` 在同 priority 上第二次注册会**抛错**，于是首方 Plan 插件装配失败、web boot 断言失败、应用起不来。选它时的理由"两个模式不共存所以可以抢"混淆了**运行时**与**装配期**：不共存的是前者，抛错发生在后者。改用零占用者的 `conversation.input.left`（list），代价只是位置在工具行左侧 |
 | **「文件被改过就拒绝」** | 这条闸门会把**埋探针本身**判成违规，于是插件的正常流程被自己锁死。判据必须收窄为「出现 `dsh-debug:change` 标记或自报 `changedFiles`」 |
 | **用「文件数」做残留阈值**（探针文件 ≥ 3 / 6） | 最好的度量是**块数与行数**：一个文件里 20 处探针远比 6 个文件各 1 处严重。改用加权度量：残留标记行数、配对失败块数、连续无新证据轮数、无法判定归属的块数 |
 | **交卷闸门直接对 `.ts` 跑 `node --check`** | 宿主自己制造的假失败：`.ts`/`.tsx` 必然解析失败，于是要么全被判违规、要么被标「不可验证」而完全失效。限定"只查本轮被工具触碰过的文件" + 按扩展名选解析器 + 严格区分 `failed` 与 `unverifiable` + 留逃生口（记脏而不拒绝） |

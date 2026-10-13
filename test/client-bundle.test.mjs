@@ -32,6 +32,15 @@ const NODE = process.execPath
 /** 座位 key：改这里就会同时提醒改测试与。 */
 const SLOT_KEY = 'conversation.input.dock'
 const SLOT_ID = 'debug-mode-decision'
+/**
+ * 状态 tag 的座位：list 座位、当前零占用者。
+ *
+ * [!] 绝不能是 `conversation.input.plan`：那是 `kind: "single"`，在同一个 priority 上
+ * 注册第二次会**抛错**（不是后者顶掉前者），于是首方 Plan 插件装配失败、web boot
+ * 断言失败、**应用启动即崩**（2026-10-13 实测）。下面那条"座位冲突"测试守的就是这件事。
+ */
+const CHIP_KEY = 'conversation.input.left'
+const CHIP_ID = 'debug-mode-chip'
 
 /**
  * 迷你测试渲染器。
@@ -165,7 +174,13 @@ async function loadExports() {
   return { registration, exportsObject, requested }
 }
 
-/** 把 apply(ctx) 的自注册跑起来，返回注册下来的组件与注册参数。 */
+/**
+ * 把 apply(ctx) 的自注册跑起来，返回**两个座位**各自注册下来的组件。
+ *
+ * 两个 cell（输入框上方的卡片 + Plan chip 那一格的状态 tag）都要在这里拿到：
+ * 它们各自独立注册，任何一个漏注册都会让界面上少一块，而这类"少一块"在真机里
+ * 往往表现为静默空白，只有这里能提前拦住。
+ */
 function mountPanel(exportsObject) {
   const injections = []
   const registers = []
@@ -182,11 +197,24 @@ function mountPanel(exportsObject) {
     },
   }
   exportsObject.apply(ctx)
-  assert.equal(injections.length, 1, 'apply 必须且只能声明一个座位')
+  // 裸调 register 会在座位尚未声明时**静默丢掉**这一格，所以 apply 只能声明 inject。
+  assert.equal(injections.length, 2, 'apply 必须声明两个座位：面板卡片与状态 tag')
   assert.equal(registers.length, 0, 'apply 自己不得裸调 register（座位可能尚未声明）')
-  injections[0].callback()
-  assert.equal(registers.length, 1, '座位声明后回调应完成注册')
-  return { injections, registers, panel: registers[0].component, options: registers[0].options }
+  for (const injection of injections) injection.callback()
+  assert.equal(registers.length, injections.length, '每个座位声明后回调都应完成注册')
+
+  const bySeat = new Map(registers.map((entry) => [entry.options.name, entry]))
+  assert.ok(bySeat.has(SLOT_KEY), `必须注册 ${SLOT_KEY} 上的面板卡片`)
+  assert.ok(bySeat.has(CHIP_KEY), `必须注册 ${CHIP_KEY} 上的状态 tag`)
+
+  return {
+    injections,
+    registers,
+    panel: bySeat.get(SLOT_KEY).component,
+    panelOptions: bySeat.get(SLOT_KEY).options,
+    chip: bySeat.get(CHIP_KEY).component,
+    chipOptions: bySeat.get(CHIP_KEY).options,
+  }
 }
 
 /** 从 createElement 树里收集所有 button 元素（用于断言禁用态）。 */
@@ -220,9 +248,9 @@ test('产物是一个自洽的 Module Loader 注册脚本', async () => {
 
 test('apply(ctx) 用声明感知的 inject 注册到输入框**上方**的座位', async () => {
   const { exportsObject } = await loadExports()
-  const { injections, options } = mountPanel(exportsObject)
+  const { injections, panelOptions: options } = mountPanel(exportsObject)
 
-  assert.equal(injections[0].seat, SLOT_KEY, `座位必须是 ${SLOT_KEY}`)
+  assert.equal(injections[0].seat, SLOT_KEY, `第一个座位必须是 ${SLOT_KEY}`)
   assert.equal(options.name, SLOT_KEY)
   assert.equal(SLOT_KEY, 'conversation.input.dock',
     '这张卡片必须在输入框**上方**：首方把 conversation.input.dock 在文档流里渲染在 inputBar 之前，'
@@ -230,6 +258,124 @@ test('apply(ctx) 用声明感知的 inject 注册到输入框**上方**的座位
   assert.equal(options.id, SLOT_ID, '用自己的 id 旁加一格，不覆盖别人在同一个 dock 里的 cell')
   assert.ok(Number.isFinite(options.order), 'order 必须显式给，否则会插到别人的前面去')
   assert.equal(typeof options.label, 'function', 'label 用 thunk，切语言时无需重注册')
+})
+
+test('状态 tag：挂在零占用者的 list 座位上，是一个带叉的 chip（叉 = 「问题已解决」）', async () => {
+  const { exportsObject } = await loadExports()
+  const { injections, chip, chipOptions } = mountPanel(exportsObject)
+
+  const seat = injections.find((entry) => entry.seat === CHIP_KEY)
+  assert.ok(seat, `必须声明座位 ${CHIP_KEY}`)
+  assert.equal(chipOptions.name, CHIP_KEY)
+  assert.equal(chipOptions.id, CHIP_ID, '用自己的 id 注册，不与别人争同一个 cell key')
+  assert.equal(CHIP_KEY, 'conversation.input.left',
+    'tag 必须挂在 conversation.input.left：它渲染在输入框工具行里的 + / 回形针之后；'
+    + '换回 conversation.input.plan 会让首方 Plan 插件注册时抛错、整次 web boot 崩掉')
+  assert.ok(Number.isFinite(chipOptions.order), 'order 必须显式给')
+
+  const originalFetch = globalThis.fetch
+  try {
+    // 没有任务 → 渲染空（座位服务所有会话，无关会话里绝不能挂一个空 tag）。
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ task: null }) })
+    assert.equal(await react.run(() => chip({ sessionId: 's1' })), null, '没有任务时 tag 必须渲染 null')
+
+    // 有任务 → 一个写着「调试」的 chip，叉可点。
+    const calls = []
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url, init })
+      if (String(url).includes('/state')) {
+        return { ok: true, json: async () => ({ task: { hash: 'deadbeef', round: 1, status: 'active' } }) }
+      }
+      return { ok: true, json: async () => ({ ok: true }) }
+    }
+    const tree = await react.run(() => chip({ sessionId: 's1' }))
+    assert.ok(tree, '有活跃任务时必须渲染 tag')
+    assert.equal(tree.type, 'button', 'chip 是 button：那个叉要能点')
+    assert.equal(collectText(tree).join(''), '调试', 'tag 上的文字就是「调试」')
+    assert.equal(collectByType(tree, 'svg').length, 1, '关闭图标用内联 SVG，不用字符图标')
+    assert.ok(String(tree.props['aria-label'] ?? '').length > 0,
+      '按钮必须有无障碍名字：眼睛看到的是叉，屏幕阅读器要听到动作')
+    assert.equal(tree.props['data-debug-status'], 'active', '状态放在 data 属性上，供面板/排查识别')
+
+    // [!] 叉的语义与窗口：表态 = 「问题已解决」，且**不等 awaiting-user**。
+    // 这正是"进了调试就出不来"那个反馈的修复点：POST /resolve 多带 anytime: true。
+    calls.length = 0
+    tree.props.onClick()
+    await settle()
+    const posts = calls.filter((call) => call.init?.method === 'POST')
+    assert.equal(posts.length, 1, '点一次叉只发一次表态')
+    assert.ok(posts[0].url.endsWith('/dsh-debug-mode/resolve'),
+      '叉走既有的 /resolve（同一个 resolved 表态），不新开第二条语义')
+    assert.deepEqual(JSON.parse(posts[0].init.body),
+      { hash: 'deadbeef', sessionId: 's1', anytime: true },
+      'anytime: true 是它能在任意状态表态的载体；面板按钮不带这个标记')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+/**
+ * `SlotCore.register` 对 `kind: "single"` 的真实语义（逐字抄自
+ * `@deepseek-ai/dsh-web-frontend` 的 `SlotCore`）：
+ *
+ *     case "single": {
+ *       const m = i.entries.find(g => (g.options.priority ?? 0) === c)
+ *       if (m) throw new Error(`single slot "${t.name}" already has a registration ...`)
+ *     }
+ *
+ * 它**抛错**（不是"后来者顶掉前者"）。这正是 2026-10-13 那次启动崩溃的根因：
+ * 我们按 priority 0 进了 `conversation.input.plan`，轮到首方 Plan 插件注册时它抛错、
+ * entry 起不来，web boot 直接断言失败。
+ *
+ * 这个替身实现的**唯一职责**就是照抄那一条判据：单占用座位 + 同 priority 第二次注册 = 抛。
+ * 于是这里能证明一件真事——**把我们两个 cell 注册进去，不会让任何后续注册者抛错**。
+ */
+function singleKindGuard() {
+  const entries = []
+  return {
+    registered: entries,
+    register(options) {
+      if (SINGLE_SEATS.has(options.name)) {
+        const priority = options.priority ?? 0
+        const occupied = entries.find(
+          (entry) => entry.name === options.name && (entry.priority ?? 0) === priority)
+        if (occupied) {
+          throw new Error(`single slot "${options.name}" already has a registration `
+            + `at priority ${priority} (registered by ${occupied.id})`)
+        }
+      }
+      entries.push(options)
+      return () => undefined
+    },
+  }
+}
+
+/** 首方声明为 `kind: "single"` 的输入行座位：在这些格子上注册第二个 occupant = 抛错。 */
+const SINGLE_SEATS = new Set([
+  'conversation.input.plan',
+  'conversation.input.permission',
+  'conversation.input.model',
+  'conversation.input.activity',
+  'conversation.input.attachments',
+])
+
+test('本插件不会占任何 single 座位：那会让首方插件注册时抛错、把启动打崩', async () => {
+  const { exportsObject } = await loadExports()
+  const { registers } = mountPanel(exportsObject)
+
+  for (const { options } of registers) {
+    assert.ok(!SINGLE_SEATS.has(options.name),
+      `${options.name} 是 kind:"single" 座位：在同一个 priority 上注册第二次会抛错，`
+      + '首方插件因此装配失败、web boot 崩掉（2026-10-13 实测事故）')
+  }
+
+  // 行为证明：用照抄了那条判据的替身，把我们两个 cell 注册进去，再让"首方"注册一次。
+  const guard = singleKindGuard()
+  for (const { options } of registers) guard.register(options)
+  assert.doesNotThrow(() => {
+    // 模拟首方 Plan chip 在同一 priority (0) 上注册它自己的 cell。
+    guard.register({ name: 'conversation.input.plan', id: 'plan-mode-control', order: 0 })
+  }, '本插件占过的座位必须经得起首方随后注册——否则崩的就是启动')
 })
 
 test('没有会话或没有任务时渲染空（不得在每会话挂空壳）', async () => {
