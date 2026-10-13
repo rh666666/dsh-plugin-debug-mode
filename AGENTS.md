@@ -272,9 +272,8 @@ DSH 有两条互不相通的客户端通道，API 名一样、能力完全不同
 1. **只写 `src/client.js`，不碰 `lib/client.js`**（后者是生成物，会被覆盖）。
 2. 产物必须带 `window.__ModuleLoader__.load({ id, factory })` 外壳，`id` 逐字等于包名；
    宿主不做编译，直接原样下发，所以 ESM 语法上线必白屏。构建脚本负责套壳。
-3. 客户端半现在坐**两个座位**，都只注册一次却服务**所有会话**——必须按 `sessionId`
-   自过滤，无关时 `return null`；**绝不要**在模块级放「当前任务」这类全局状态。
-   座位本身的事实（`kind` / `scope` / occupants）见 §6 那两条。
+3. 组件服务**所有会话**——必须按 `sessionId` 自过滤，无关时 `return null`；
+   **绝不要**在模块级放「当前任务」这类全局状态。
 
 ### 4.4 代码风格
 
@@ -475,41 +474,23 @@ no-op，实测因此丢过两行版本记录）；验证表格要数"每行有�
   `SECTION_ORDERS`（本插件用 `TOOLS_SDK=5000` 之后的 **5050**）。
 - 客户端入口是 `exports["./client"].default`（不是 `main`），且产物**必须**是
   `window.__ModuleLoader__.load({ id, factory })` 脚本——宿主不做编译（§4.3）。
-- 客户端半坐**两个座位**，两个都用 `ctx.slots.inject`（声明感知）注册。
-  ① **`conversation.input.dock`**（list / session，**输入框卡片正上方**）= 那张可折叠面板卡片；
-  ② **`conversation.input.left`**（list / session，**输入框工具行左侧**、`+` / 回形针之后）
-  = 状态 tag（chip）。
-  两者都**不要**换成 `conversation.composer.dock`：它渲染在卡片**下方**，会把输入框往上挤
-  （用户实测原话是「挤兑了原有的提示词输入框的位置」）。首方在 `composerStack` 里把
-  `input.dock` 渲染在 `inputBar` **之前**，所以它贴近输入框、不会挪动它、也**不可能遮挡**它
-  ——那是文档流兄弟节点，不是 overlay（`conversation.input.overlay` 才是浮在卡片里的那个）。
-  `input.dock` 给到 `useInput`，面板因此能看见用户正在打什么，从而避免
-  「打了半句又顺手点按钮 ⇒ 同一条描述送两遍」的竞态。
-- **`kind: "single"` 的座位不能占——注册会抛错，抛在装配期，后果是整个应用起不来**。
-  首方那一行 chip（Plan / 权限 / 模型 / 活动）所在的 `conversation.input.plan` 等座位是
-  **单占用**的，而 `SlotCore.register` 对它的判据是**抛错**而不是"后来者顶掉前者"：
-  `case "single": { const m = i.entries.find(g => (g.options.priority ?? 0) === c); if (m) throw … }`
-  （依据：`@deepseek-ai/dsh-web-frontend` 的 `SlotCore`）。装配是**同步**的（`apply` 里就注册），
-  所以第二个注册者当场抛错、它的 entry 起不来，web boot 的 `assertEntriesActive` 断言
-  「N entry did not activate」⇒ **启动即崩，与有没有活跃任务无关**。推论三条：
-  ① 单占用座位上的冲突是**装配期错误**，不是观感取舍——"两个模式不共存所以可以抢"这个理由
-     **不成立**：不共存的是**运行时**，抛错发生在**装配期**；
-  ② inspect provider 的 `replaceRisk: "shadows-shipped-ui"` 只说"会遮住首方 UI"，
-     **没**说到"会抛错、会崩"。判断一格能不能占，看 `kind` / `scope` / 当前 `occupants`，
-     别只读 `purpose` 描述。`list` 座位按 `id` 去重、天然可共存；`single` 一定不能碰；
-  ③ 想和别人的 chip 并排，正确做法是**换一个 list 座位**（或请首方把那一格改成 list），
-     不是在 single 座位上换 priority——换 priority 只会让崩溃从对方转到自己身上。
-  回归守卫：`test/client-bundle.test.mjs` 里那条用 SlotCore 判据做的替身测试。
-- **状态 tag（chip）上的叉 = 「问题已解决」这个表态本身**（v0.20）：它 POST
-  `/dsh-debug-mode/resolve`，但多带一个 `anytime: true`，于是**不受**
-  `awaiting-user` 那道门约束——面板按钮仍保持窗口语义（`anytime` 只对 `resolved` 生效，
-  任务存在 / 属于本会话 / 未关闭三条校验一条不少，幂等照旧）。
-  为什么必须有它：两道门叠起来（S5 要求 `awaiting-user` + `dsh_debug_end` 要求
-  `userVerdict === 'resolved'`）会让用户**进了调试就出不来**（实测反馈原话）。
-  实现上注意两点：① `anytime` 那条路的状态迁移走**两步**
-  （`active → awaiting-user → awaiting-agent`）——`lib/task.js` 的 `TRANSITIONS` 里
-  `active` 只能去 `awaiting-user` / `closed`，非法迁移是抛错而不是兜底；
-  ② 这一轮给 Agent 的指令必须点明"用户可能没走完整复现流程，**不要假装验证过**"。
+- 客户端半的两个座位：`conversation.input.dock`（面板卡片，输入框卡片**正上方**）与
+  `conversation.input.left`（状态 tag，工具行左侧）。**都别换成 `conversation.composer.dock`**
+  （渲染在卡片下方、会挤走输入框的高度）。座位能不能动，见 §6 那条座位与 `single` 的规矩。
+- **座位选型只看 `kind` / `scope` / 现有 `occupants`，别只看 `purpose` 描述。**
+  `list` 座位要自己的 `id`（按 id 去重、天然可共存）；**`kind: "single"` 一定不能碰**——
+  `SlotCore.register` 在同一个 priority 上第二次注册是**抛错**（不是后来者顶掉前者），
+  而注册发生在**同步的装配期**，于是对方的 entry 起不来、Web 启动直接失败。
+  推论：① "两个模式不共存所以可以抢"**不成立**（不共存的是运行时，抛错在装配期）；
+  ② inspect 的 `replaceRisk: "shadows-shipped-ui"` 只说"会遮住首方 UI"，没说到会抛错。
+  要跟别人的 chip 并排就**换一个 list 座位**（或请首方把那一格改成 list），
+  不是换 priority——那只会把崩溃从对方转到自己身上。
+- **状态 tag 上的叉 = 「问题已解决」这个表态本身**，不是第二套"取消"：走同一个
+  `/resolve`，只多带 `anytime: true`（面板按钮不带，窗口语义原样保留）。要它是为了
+  别把用户**锁在调试里**（否则必须等 Agent 交卷才能表态）。两处实现约束：
+  状态迁移走两步（`active → awaiting-user → awaiting-agent`，`TRANSITIONS` 白名单里
+  `active` 只能去 `awaiting-user` / `closed`）；该轮给 Agent 的指令必须点明
+  "没验证就填 `verified: false`，不要假装验证过"。
 - 面板**默认折叠**，只在 `awaiting-user` 自动展开；折叠态的那一行必须自己说清"轮到谁"。
   这是"不占输入框地方"的另一半——只在上面是不够的。
 - 面板内容只有两样：`dsh_debug_report` 的 **`headline`**（一句话结论）与
