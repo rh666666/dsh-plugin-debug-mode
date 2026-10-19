@@ -79,6 +79,36 @@ function validateValue(schema, value, path) {
   if (schema.enum) assert.ok(schema.enum.includes(value), `${path} 不在 enum 里：${value}`)
 }
 
+/**
+ * 宿主在 schema 校验之外还会把 `execute` 的返回值快照成 lossless JSON：对象里值为
+ * `undefined` 的自有键、非有限数、稀疏数组、类实例都会让整次调用变成
+ * `ToolOutputError`（"value is not lossless JSON"），即使操作本身已经完成。
+ * 这里按同一套规则逐层断言，避免再次出现"操作成功、工具输出报错"。
+ */
+function assertLosslessJson(value, path = 'value') {
+  if (value === null) return
+  const type = typeof value
+  if (type === 'string' || type === 'boolean') return
+  if (type === 'number') {
+    assert.ok(Number.isFinite(value), `${path} 必须是有限数字`)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      assert.ok(Object.hasOwn(value, index), `${path}[${index}] 不能是稀疏数组的空洞`)
+      assertLosslessJson(value[index], `${path}[${index}]`)
+    }
+    return
+  }
+  assert.equal(type, 'object', `${path} 不能是 ${type}（lossless JSON 不接受函数/undefined/symbol）`)
+  const proto = Object.getPrototypeOf(value)
+  assert.ok(proto === Object.prototype || proto === null, `${path} 必须是普通对象`)
+  for (const [key, child] of Object.entries(value)) {
+    assert.notEqual(child, undefined, `${path}.${key} 的值是 undefined：宿主会判成非 lossless JSON`)
+    assertLosslessJson(child, `${path}.${key}`)
+  }
+}
+
 test('五个工具的名字、必填字段与 schema 都在宿主支持的子集里', () => {
   const definitions = toolDefinitions({ /* service 只被 execute 用到 */ })
   assert.deepEqual(definitions.map((tool) => tool.name), [
@@ -142,25 +172,33 @@ test('每个工具的返回值都通得过自己的 output.schema（否则宿主
     const refused = await definitions.dsh_debug_start.execute({ goal: 'x' }, exec)
     assert.equal(refused.ok, false)
     validateValue(definitions.dsh_debug_start.output.schema, refused, 'start.refused')
+    assertLosslessJson(refused, 'start.refused')
 
     // ② 签票后 start + report + resolve + end 的每个返回值。
     await service.issueTicket({ sessionId: 'session-x', text: '现象', workspace: workspace.root })
     const started = await definitions.dsh_debug_start.execute({ goal: '现象' }, exec)
     assert.equal(started.ok, true)
     validateValue(definitions.dsh_debug_start.output.schema, started, 'start.ok')
+    assertLosslessJson(started, 'start.ok')
 
     const reported = await definitions.dsh_debug_report.execute({ analysis: '结论' }, exec)
     validateValue(definitions.dsh_debug_report.output.schema, reported, 'report')
+    assertLosslessJson(reported, 'report')
 
     const read = await definitions.dsh_debug_read.execute({ limit: 10 }, exec)
     validateValue(definitions.dsh_debug_read.output.schema, read, 'read')
+    assertLosslessJson(read, 'read')
 
     await service.resolve({ hash: started.hash, sessionId: 'session-x' })
     const ended = await definitions.dsh_debug_end.execute({ summary: '收工' }, exec)
     validateValue(definitions.dsh_debug_end.output.schema, ended, 'end')
+    assertLosslessJson(ended, 'end')
+    assert.equal('incompleteReasons' in ended, false,
+      '干净收尾不能带 incompleteReasons 键：值为 undefined 会被宿主判成非 lossless JSON')
 
     const continued = await definitions.dsh_debug_continue.execute({}, exec)
     validateValue(definitions.dsh_debug_continue.output.schema, continued, 'continue')
+    assertLosslessJson(continued, 'continue')
   } finally {
     await workspace.cleanup()
     await art.cleanup()

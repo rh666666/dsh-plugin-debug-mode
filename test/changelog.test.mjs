@@ -16,6 +16,20 @@ const SECTION_TYPES = new Set(['新增', '变更', '弃用', '移除', '修复',
 /** 单条记录的长度上限（字符）。上限的意义是"一句话说清改了什么"。 */
 const MAX_ENTRY_CHARS = 120
 
+/** 老小节写 `x.y`（等价于 `x.y.0`），补丁发版写 `x.y.z`。 */
+function normalizeVersion(text) {
+  return text.split('.').length === 2 ? `${text}.0` : text
+}
+
+function compareVersions(left, right) {
+  const a = left.split('.').map(Number)
+  const b = right.split('.').map(Number)
+  for (let index = 0; index < 3; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index]
+  }
+  return 0
+}
+
 async function readChangelog() {
   const text = await readFile(join(REPO, 'CHANGELOG.md'), 'utf8')
   const releases = []
@@ -23,7 +37,7 @@ async function readChangelog() {
   let current = null
   let section = null
   for (const [index, line] of text.split('\n').entries()) {
-    const heading = line.match(/^## \[(\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})$/)
+    const heading = line.match(/^## \[(\d+\.\d+(?:\.\d+)?)\] - (\d{4}-\d{2}-\d{2})$/)
     if (heading) {
       current = { version: heading[1], date: heading[2], line: index + 1, sections: [] }
       releases.push(current)
@@ -48,13 +62,15 @@ test(' 更新日志：每个版本一个二级标题，版本号连续且新版�
   const { releases } = await readChangelog()
   assert.ok(releases.length >= 20, `只解析到 ${releases.length} 个版本，格式或位置不对`)
 
-  const numbers = releases.map((release) => Number(release.version.split('.')[1]))
-  assert.equal(new Set(numbers).size, numbers.length, `版本号有重复：${numbers.join(',')}`)
-  assert.equal(numbers[0], Math.max(...numbers), '最新版本必须排在最前')
+  const versions = releases.map((release) => normalizeVersion(release.version))
+  assert.equal(new Set(versions).size, versions.length, `版本号有重复：${versions.join(',')}`)
+  const descending = versions.slice().sort(compareVersions).reverse()
+  assert.deepEqual(versions, descending, `版本必须严格从新到旧排列：${versions.join(',')}`)
 
+  const minors = releases.map((release) => Number(release.version.split('.')[1]))
   const missing = []
-  for (let n = 1; n <= Math.max(...numbers); n += 1) {
-    if (!numbers.includes(n)) missing.push(`0.${n}`)
+  for (let n = 1; n <= Math.max(...minors); n += 1) {
+    if (!minors.includes(n)) missing.push(`0.${n}`)
   }
   assert.deepEqual(missing, [], `缺这些版本的小节：${missing.join('、')}`)
 })
@@ -113,11 +129,11 @@ test(' 更新日志：不出现只有维护者能看懂的引用', async () => {
     `以下条目引用了内部路径、章节号或旧版本号：\n${offenders.join('\n')}`)
 })
 
-test(' 版本号纪律：package.json 的 version == 最新小节 + ".0"', async () => {
+test(' 版本号纪律：package.json 的 version == 最新小节版本', async () => {
   const { releases } = await readChangelog()
   assert.ok(releases.length > 0, '没找到任何版本小节，无法与 package.json 对账')
-  const newest = releases[0].version
+  const newest = normalizeVersion(releases[0].version)
   const pkg = JSON.parse(await readFile(join(REPO, 'package.json'), 'utf8'))
-  assert.equal(pkg.version, `${newest}.0`,
-    `package.json 的 version 是 ${pkg.version}，最新小节是 ${newest}，应写作 ${newest}.0`)
+  assert.equal(pkg.version, newest,
+    `package.json 的 version 是 ${pkg.version}，最新小节是 ${releases[0].version}，应写作 ${newest}`)
 })

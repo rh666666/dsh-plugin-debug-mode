@@ -5,6 +5,12 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.1] - 2026-10-20
+
+### 修复
+
+- 修复收尾成功后 `dsh_debug_end` 仍报工具输出错误的问题：操作已完成时 Agent 能正常拿到收尾结果。
+
 ## [0.22] - 2026-10-20
 
 ### 修复

@@ -70,10 +70,10 @@ node scripts/probe-selfcheck.mjs   # 探针边界自检（退出码可进 CI；-
 只在用户说要发版时动。`CHANGELOG.md` 是面向使用者的发布日志，不是工作日志，也不承载
 设计说明；功能做完、测试全绿都不算发版。
 
-格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)：`## [x.y] - 日期`
-小节 + 新增 / 变更 / 移除 / 修复 / 安全 分类。每条**一句话**说清对使用者意味着什么；
-实现细节写进代码注释或提交信息。发版时最新小节版本与 `package.json` 的 `X.Y.0` 相等
-（`test/changelog.test.mjs` 守卫），日期现取。
+格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)：`## [x.y.z] - 日期`
+小节（补丁号可省略，省略时按 `x.y.0` 对账）+ 新增 / 变更 / 移除 / 修复 / 安全 分类。每条
+**一句话**说清对使用者意味着什么；实现细节写进代码注释或提交信息。发版时最新小节版本与
+`package.json` 的 `version` 相等（`test/changelog.test.mjs` 守卫），日期现取。
 
 ## 2. 维护这一份文件
 
