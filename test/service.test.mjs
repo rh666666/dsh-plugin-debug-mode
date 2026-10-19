@@ -1,7 +1,7 @@
 /**
  * test/service.test.mjs —— 走完 S1→S7 的端到端守卫。
  *
- * 这里钉的不是"函数返回值"，而是**核心不变量**（AGENTS.md §1.1）：
+ * 这里钉的不是"函数返回值"，而是**核心不变量**：
  *   · 入口唯一：无票调用 `dsh_debug_start` 一律被拒；
  *   · 一个任务一个哈希；`continue` 清空日志但哈希不变；
  *   · 探针账与修复账分开记，收尾**只撤探针、绝不回滚修复**；
@@ -417,9 +417,19 @@ test('S5/S7：未经用户表态 end 被拒；resolve 幂等只唤醒一次；en
     assert.equal(resolved.ok, true)
     assert.equal(resolved.status, 'awaiting-agent')
     assert.equal(fake.prompts.length, 1, 'S5 必须唤醒 Agent 一次')
-    assert.match(fake.prompts[0].content[0].text, /问题已解决/)
     assert.equal(fake.prompts[0].sessionId, SESSION)
     assert.equal(fake.prompts[0].mode, 'queue')
+    // [!] 投出去的**只有用户自己的话**：他没在 note 里补东西，所以正文就是按钮文案。
+    // 指令（收尾该调什么、别用 git checkout）改由 systemPrompt 注入——把两者塞进
+    // 同一条消息就是在对话里伪造用户发言（`/debug` 上已经摘掉过同一个错误）。
+    assert.equal(fake.prompts[0].content[0].text, '问题已解决')
+    assert.equal(fake.prompts[0].content.length, 1, '一轮里只该有那一条用户消息')
+    assert.ok(!/dsh_debug_end/.test(fake.prompts[0].content[0].text), '指令不许混进用户消息')
+    // 注入段承载指令：它必须立刻变成"收尾"那一支。
+    const signalText = service.signalGuidanceFor(SESSION)
+    assert.equal(signalText.verdict, 'resolved')
+    assert.equal(signalText.hash, started.hash)
+    assert.equal(signalText.anytime, false)
 
     // 重复点击：幂等，绝不产生第二次 prompt。
     const again = await service.resolve({ hash: started.hash, sessionId: SESSION })
@@ -474,10 +484,14 @@ test('chip 上的叉 = 「问题已解决」，但它不受 awaiting-user 约束
     assert.equal(chipWay.status, 'awaiting-agent')
     assert.equal(service.tasks.get(SESSION).userVerdict, 'resolved')
     assert.equal(fake.prompts.length, 1, '表态必须唤醒 Agent 去收尾')
-    assert.match(fake.prompts[0].content[0].text, /问题已解决/)
-    // 用户跳过了"复现 → 表态"那个窗口，所以这一轮必须明确禁止假装验证过。
-    assert.match(fake.prompts[0].content[0].text, /verified/)
-    assert.match(fake.prompts[0].content[0].text, /假装验证过/)
+    // 用户只按了叉：他的原话就是那个动作所对应的按钮文案（不替他转述）。
+    assert.equal(fake.prompts[0].content[0].text, '问题已解决')
+    // 用户跳过了"复现 → 表态"那个窗口，所以注入段必须明确禁止假装验证过。
+    assert.equal(fake.prompts[0].content[0].text.includes('verified'), false,
+      '指令在注入段里，不在用户消息里')
+    const chipSignal = service.signalGuidanceFor(SESSION)
+    assert.equal(chipSignal.verdict, 'resolved')
+    assert.equal(chipSignal.anytime, true, 'anytime 是注入段那条更硬要求的依据')
 
     // ③ 幂等：叉连点两次只唤醒一次。
     const again = await service.resolve({ hash: started.hash, sessionId: SESSION, anytime: true })
@@ -599,6 +613,109 @@ test('guidanceFor：无任务/任务结束后必须为空（否则没进调试�
 
     service.onSessionDisposed(SESSION)
     assert.equal(service.guidanceFor(SESSION), null)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('pendingTicket：同步、只读内存、不消费（给 systemPrompt 的 thunk 用）', async () => {
+  const { service, workspace, art } = await setup()
+  try {
+    assert.equal(service.pendingTicket(SESSION), null, '没签票就是 null')
+    await service.issueTicket({ sessionId: SESSION, text: '保存后不刷新', workspace: workspace.root })
+    const ticket = service.pendingTicket(SESSION)
+    assert.ok(ticket, '持票期必须能看到这张票')
+    assert.equal(ticket.text, '保存后不刷新')
+    // thunk 是同步的：这个访问器绝不许返回 Promise（返回 Promise 会被渲染成 "[object Promise]"）。
+    assert.equal(typeof ticket.then, 'undefined')
+    // 只读：读一百次也不能把票用掉（否则提示词渲染会顺手消费掉授权）。
+    for (let i = 0; i < 100; i += 1) assert.ok(service.pendingTicket(SESSION))
+    assert.ok(service.tickets.has(SESSION))
+
+    // 过期的票当作没有，但**不在渲染路径上删**（删除是异步且有副作用的事）。
+    const live = service.tickets.get(SESSION)
+    live.issuedAt = Date.now() - 31 * 60 * 1000
+    assert.equal(service.pendingTicket(SESSION), null)
+    assert.ok(service.tickets.has(SESSION), 'pendingTicket 不许顺手删票')
+
+    // start 成功后票被消费 ⇒ 段落自动从"持票态"换成"任务态"。
+    live.issuedAt = Date.now()
+    const started = await service.start({ sessionId: SESSION, goal: '保存后不刷新', workspace: workspace.root })
+    assert.equal(started.ok, true, started.text)
+    assert.equal(service.pendingTicket(SESSION), null)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('用户信号投的是**用户原话**：有 note 就投 note，没有就投按钮文案（指令走注入）', async () => {
+  const { service, fake, workspace, art } = await setup()
+  try {
+    const started = await startTask(service, workspace)
+    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '交卷' })
+
+    // ① 用户补了一句话：那条消息就是他的原话，逐字，不附加任何指令。
+    await service.reproduce({ hash: started.hash, sessionId: SESSION, note: '只在切换标签页后才复现' })
+    assert.equal(fake.prompts.length, 1)
+    assert.equal(fake.prompts[0].content[0].text, '只在切换标签页后才复现')
+    assert.equal(fake.prompts[0].content.length, 1)
+    assert.equal(service.signalGuidanceFor(SESSION).verdict, 'reproduced')
+    // 注入段才讲信号序列，而它**只**在注入段里。
+    const repro = service.signalGuidanceFor(SESSION)
+    assert.equal(repro.anytime, false)
+
+    // ② 用户什么也没补：「复现」这条路投按钮文案本身（不替他转述成"用户选择了…"）。
+    // 注意状态机：`reproduce` 之后是 `awaiting-agent`，而 `report` 只接受 `active`
+    // ——所以这里必须先让 Agent 继续（`continue`）回到 active，才谈得上再交一次卷。
+    await service.read({ sessionId: SESSION, workspace: workspace.root })
+    await service.continueDebug({ sessionId: SESSION, workspace: workspace.root, nextPlan: '换个假设' })
+    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第二轮' })
+    await service.reproduce({ hash: started.hash, sessionId: SESSION })
+    assert.equal(fake.prompts.length, 2)
+    assert.equal(fake.prompts[1].content[0].text, '问题复现，需要进一步修复')
+
+    // ③ note 会被记进任务（面板/排查要看"当时到底说了什么"），但**不进**注入段。
+    const task = service.tasks.get(SESSION)
+    await service.read({ sessionId: SESSION, workspace: workspace.root })
+    await service.continueDebug({ sessionId: SESSION, workspace: workspace.root, nextPlan: '再试一次' })
+    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第三轮' })
+    await service.resolve({ hash: started.hash, sessionId: SESSION, note: '改了缓存就好了' })
+    assert.equal(fake.prompts.length, 3)
+    assert.equal(fake.prompts[2].content[0].text, '改了缓存就好了')
+    assert.equal(task.lastSignal.text, '改了缓存就好了')
+    assert.equal(task.lastSignal.verdict, 'resolved')
+    assert.equal(task.userVerdict, 'resolved')
+    // 收尾之后信号段必须消失：`end` 关掉任务，thunk 回到空串。
+    await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(service.signalGuidanceFor(SESSION), null)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('信号段只在 `awaiting-agent` 出现（其它状态必须为空，否则会误导 Agent）', async () => {
+  const { service, workspace, art } = await setup()
+  try {
+    assert.equal(service.signalGuidanceFor(SESSION), null, '没有任务时必须为空')
+    const started = await startTask(service, workspace)
+    assert.equal(service.signalGuidanceFor(SESSION), null, 'active 时没有"用户已表态"这回事')
+    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '交卷' })
+    assert.equal(service.signalGuidanceFor(SESSION), null, 'awaiting-user 时用户还没表态')
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+    const signal = service.signalGuidanceFor(SESSION)
+    assert.equal(signal.hash, started.hash)
+    assert.equal(signal.round, 1)
+    // 用户表态后 Agent 继续（`continue` 把状态带回 `active`）——信号段必须跟着收起：
+    // 否则 Agent 会同时读到"去收尾"与"去埋点"两套互相矛盾的指令。
+    // （注意：`awaiting-agent` 上收到用户消息**不会**自动回 active，那条迁移只对
+    //  `awaiting-user` 成立——所以这里走的是 continue 这条真实路径。）
+    assert.equal(service.tasks.get(SESSION).status, 'awaiting-agent')
+    await service.continueDebug({ sessionId: SESSION, workspace: workspace.root, nextPlan: '接着查' })
+    assert.equal(service.tasks.get(SESSION).status, 'active')
+    assert.equal(service.signalGuidanceFor(SESSION), null)
   } finally {
     await workspace.cleanup()
     await art.cleanup()

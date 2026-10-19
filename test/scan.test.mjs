@@ -393,7 +393,7 @@ test('planCleanup + applyCleanup：先备份再写，且 fix 块原样保留', a
   }
 })
 
-test('verifySyntax 严格区分 failed 与 unverifiable（的教训）', () => {
+test('verifySyntax 严格区分 failed 与 unverifiable', () => {
   const verdicts = verifySyntax({
     'ok.cjs': 'module.exports = 1\n',
     'broken.cjs': 'function ( { \n',

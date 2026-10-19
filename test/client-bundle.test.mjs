@@ -623,9 +623,24 @@ test('两个按钮把用户的二选一 POST 回宿主（的路由表）', async
     assert.ok(posts[0].url.endsWith('/dsh-debug-mode/resolve'))
     assert.ok(posts[1].url.endsWith('/dsh-debug-mode/reproduce'))
     assert.deepEqual(JSON.parse(posts[0].init.body), { hash: 'deadbeef', sessionId: 's1' })
+    // [!] 按钮**不发 `note`**：宿主在没 note 时拿按钮文案当用户原话。
+    // 客户端这边把文案写死成与 `USER_SIGNAL_LABEL` 逐字一致（下面那条测试校验），
+    // 所以"用户读到的"与"Agent 收到的"是同一句话。
+    assert.equal(JSON.parse(posts[0].init.body).note, undefined, '按钮不许替用户写话')
+    assert.deepEqual(JSON.parse(posts[1].init.body), { hash: 'deadbeef', sessionId: 's1' })
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test('按钮文案与宿主 `USER_SIGNAL_LABEL` 逐字一致（用户点按钮时那就是他的原话）', async () => {
+  const { USER_SIGNAL_LABEL } = await import('../lib/prompt.js')
+  const source = await readFile(SRC, 'utf8')
+  // 源码里两个文案必须字面出现——构建产物是从它拷过去的，所以这里比源码就够了。
+  assert.ok(source.includes(USER_SIGNAL_LABEL.resolved),
+    `客户端必须有逐字相同的「${USER_SIGNAL_LABEL.resolved}」`)
+  assert.ok(source.includes(USER_SIGNAL_LABEL.reproduced),
+    `客户端必须有逐字相同的「${USER_SIGNAL_LABEL.reproduced}」`)
 })
 
 test('宿主说"残留检测未生效"时，面板必须把它显示出来（绝不假装保护着）', async () => {

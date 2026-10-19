@@ -1,12 +1,7 @@
-//  CHANGELOG.md 变更记录（版本号纪律见 AGENTS.md §4.6）是**契约产物**：
-// 每次改协议/状态机都要在这里留一行。而这一节自己出过两次错，都瞒过了一轮：
-//   ① 日期沿用了相邻行的错误值（2026-02-19，而真实是 2026-10-11）；
-//   ② **两行根本没写**——我用 `String.Replace` 拿"要写的那一行"当锚点，
-//      锚点不存在时它是**静默 no-op**，于是版本号从 0.11 直接跳到 0.18。
-//   ③ 那两行真正的形态更阴：换行被写成了字面量 `n，两行整段躺在 v0.14 的正文里，
-//      而 `^\| 0\.\d+ \|` 这类锚定行首的检查完全看不见它们。
-// 所以这里把它当数据来验：连续、无重复、表头与最新一行一致、日期合法且不倒流、
-// 一行只能有一个版本行标记；另外它还要与 package.json 的 version 对齐（AGENTS.md §4.6）。
+//  CHANGELOG.md 是**面向使用者的发布日志**，格式遵循 Keep a Changelog：
+// 版本化的小节（`## [x.y] - YYYY-MM-DD`）+ 分类条目（新增/变更/移除/修复/安全）。
+// 这里把它当数据来验，钉住四件事：版本连续、新版本在前、日期合法且不倒流、
+// 以及每条记录足够短——超过约两行的条目通常在写实现细节，那属于代码注释。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
@@ -15,103 +10,114 @@ import { fileURLToPath } from 'node:url'
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 
+/** Keep a Changelog 定义的分类；每条记录必须落在其中之一。 */
+const SECTION_TYPES = new Set(['新增', '变更', '弃用', '移除', '修复', '安全'])
+
+/** 单条记录的长度上限（字符）。上限的意义是"一句话说清改了什么"。 */
+const MAX_ENTRY_CHARS = 120
+
 async function readChangelog() {
   const text = await readFile(join(REPO, 'CHANGELOG.md'), 'utf8')
-  const rows = []
+  const releases = []
+  const entries = []
+  let current = null
+  let section = null
   for (const [index, line] of text.split('\n').entries()) {
-    const match = line.match(/^\| (0\.\d+) \| (\d{4}-\d{2}-\d{2}) \| (.*)$/)
-    if (match) rows.push({ version: match[1], date: match[2], body: match[3], line: index + 1 })
+    const heading = line.match(/^## \[(\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})$/)
+    if (heading) {
+      current = { version: heading[1], date: heading[2], line: index + 1, sections: [] }
+      releases.push(current)
+      section = null
+      continue
+    }
+    const sectionHeading = line.match(/^### (.+)$/)
+    if (sectionHeading) {
+      section = sectionHeading[1].trim()
+      if (current) current.sections.push(section)
+      continue
+    }
+    const bullet = line.match(/^- (.+)$/)
+    if (bullet) {
+      entries.push({ version: current?.version ?? null, section, body: bullet[1], line: index + 1 })
+    }
   }
-  const header = text.match(/最新版本：v(0\.\d+)/)?.[1] ?? null
-  return { rows, header }
+  return { text, releases, entries }
 }
 
-test(' 变更记录：版本号连续无缺口（"改了版本号却没写记录"必须被抓住）', async () => {
-  const { rows } = await readChangelog()
-  assert.ok(rows.length >= 10, `只解析到 ${rows.length} 行，格式或位置不对`)
+test(' 更新日志：每个版本一个二级标题，版本号连续且新版本在前', async () => {
+  const { releases } = await readChangelog()
+  assert.ok(releases.length >= 20, `只解析到 ${releases.length} 个版本，格式或位置不对`)
 
-  const numbers = rows.map((row) => Number(row.version.split('.')[1])).sort((a, b) => a - b)
+  const numbers = releases.map((release) => Number(release.version.split('.')[1]))
   assert.equal(new Set(numbers).size, numbers.length, `版本号有重复：${numbers.join(',')}`)
-  assert.equal(numbers[0], 1, `最老的记录应是 0.1，实际 0.${numbers[0]}`)
+  assert.equal(numbers[0], Math.max(...numbers), '最新版本必须排在最前')
 
-  // 逐个查缺口 —— 这条就是为 v0.12/v0.13 那次遗漏写的。
   const missing = []
-  for (let n = 1; n <= numbers[numbers.length - 1]; n += 1) {
+  for (let n = 1; n <= Math.max(...numbers); n += 1) {
     if (!numbers.includes(n)) missing.push(`0.${n}`)
   }
-  assert.deepEqual(missing, [], ` 缺这些版本的行：${missing.join('、')}（改了版本号就必须留一行）`)
+  assert.deepEqual(missing, [], `缺这些版本的小节：${missing.join('、')}`)
 })
 
-test(' 变更记录：没有"被粘在别人行里"的版本行（一行只能有一个版本行标记）', async () => {
-  // 实测事故：两条记录被写成了**字面量 `n**（反引号 + n）而不是真换行，于是它们
-  // 整段躺在 v0.14 那一行的正文里——`^\| 0\.\d+ \|` 这类锚定行首的检查**完全看不见它们**，
-  // 表面上"版本连续"，实际那两版从来没成为表格行。所以这里数的是**每行有几个**版本行标记。
-  const text = await readFile(join(REPO, 'CHANGELOG.md'), 'utf8')
-  const offenders = []
-  for (const [index, line] of text.split('\n').entries()) {
-    const markers = line.match(/\| 0\.\d+ \|/g) ?? []
-    if (markers.length > 1) offenders.push(`第 ${index + 1} 行有 ${markers.length} 个：${markers.join(' ')}`)
-    if (line.includes('`n| 0.')) offenders.push(`第 ${index + 1} 行出现字面量 \`n 紧接版本行标记`)
-  }
-  assert.deepEqual(offenders, [], `版本行被粘住了：\n${offenders.join('\n')}`)
-})
-
-test(' 变更记录：表头到表尾之间不许夹非表格行（否则中间的行不会被当成记录）', async () => {
-  const text = await readFile(join(REPO, 'CHANGELOG.md'), 'utf8')
-  const lines = text.split('\n')
-  const first = lines.findIndex((line) => /^\| 0\.\d+ \| \d{4}-\d{2}-\d{2} \|/.test(line))
-  const last = lines.map((line) => /^\| 0\.\d+ \| \d{4}-\d{2}-\d{2} \|/.test(line)).lastIndexOf(true)
-  assert.ok(first >= 0 && last > first, '没找到 CHANGELOG.md 的版本行区间')
-  for (let index = first; index <= last; index += 1) {
-    assert.ok(lines[index].startsWith('|'), `第 ${index + 1} 行夹在版本行之间却不是表格行：${lines[index].slice(0, 60)}`)
-  }
-})
-
-test(' 表头的版本号 == 表里最新那一行（否则表头是空头支票）', async () => {
-  const { rows, header } = await readChangelog()
-  assert.ok(header, '没找到「最新版本：vX.Y」表头')
-  const newest = rows
-    .map((row) => row.version)
-    .sort((a, b) => Number(a.split('.')[1]) - Number(b.split('.')[1]))
-    .pop()
-  assert.equal(header, newest, `表头写的是 v${header}，最后一行却是 v${newest}`)
-})
-
-test(' 日期：合法、不在未来、新旧不倒流（按表内顺序：新→旧）', async () => {
-  const { rows } = await readChangelog()
+test(' 更新日志：日期合法、不在未来、按版本顺序不倒流', async () => {
+  const { releases } = await readChangelog()
   const today = new Date()
   const todayText = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
 
   let previous = null
-  for (const row of rows) {
-    // 合法日期：`2026-02-31` 这种能被 Date 悄悄挪到 3 月，所以回读一遍比对。
-    const parsed = new Date(`${row.date}T00:00:00`)
+  for (const release of releases) {
+    // `2026-02-31` 会被 Date 悄悄挪到 3 月，所以回读一遍比对。
+    const parsed = new Date(`${release.date}T00:00:00`)
     const roundTrip = `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}-${String(parsed.getDate()).padStart(2, '0')}`
-    assert.equal(roundTrip, row.date, `第 ${row.line} 行的日期不合法：${row.date}`)
-
-    // 未来日期一定是写错了（实测踩过：把 10-11 写成 02-19 是过去，但反过来的错也存在）。
-    assert.ok(row.date <= todayText, `第 ${row.line} 行的日期在未来：${row.date} > 今天 ${todayText}`)
-
-    // 表是"新→旧"，所以日期应当单调不增。
+    assert.equal(roundTrip, release.date, `第 ${release.line} 行的日期不合法：${release.date}`)
+    assert.ok(release.date <= todayText, `第 ${release.line} 行的日期在未来：${release.date}`)
     if (previous !== null) {
-      assert.ok(row.date <= previous.date, `第 ${row.line} 行日期倒流：${row.date} 晚于上一行 ${previous.date}`)
+      assert.ok(release.date <= previous, `第 ${release.line} 行日期倒流：${release.date} 晚于上一版本 ${previous}`)
     }
-    previous = row
+    previous = release.date
   }
 })
 
-test(' 每一行都有实质内容（不是占位符）', async () => {
-  const { rows } = await readChangelog()
-  for (const row of rows) {
-    assert.ok(row.body.length >= 20, `第 ${row.line} 行（v${row.version}）太短，像是占位：${row.body}`)
+test(' 更新日志：每个版本都有条目，且只用 Keep a Changelog 的分类', async () => {
+  const { releases, entries } = await readChangelog()
+  for (const release of releases) {
+    assert.ok(release.sections.length > 0, `v${release.version} 没有任何分类小节`)
+    for (const section of release.sections) {
+      assert.ok(SECTION_TYPES.has(section), `v${release.version} 用了未知分类「${section}」`)
+    }
+  }
+  for (const entry of entries) {
+    assert.ok(entry.version, `第 ${entry.line} 行的条目不属于任何版本`)
+    assert.ok(entry.section, `第 ${entry.line} 行的条目不属于任何分类`)
   }
 })
 
-test(' 版本号纪律：package.json 的 version == 表头版本 + ".0"（只改一处必红）', async () => {
-  // AGENTS.md §4.6：版本号只有一处权威（CHANGELOG.md 顶部的 `最新版本：vX.Y`），
-  // 它必须同时等于表里最新那一行与 package.json 的 version（写作 X.Y.0）。
-  const { header } = await readChangelog()
-  assert.ok(header, '没找到「最新版本：vX.Y」表头，无法与 package.json 对账')
+test(' 更新日志：条目只说改了什么，不写实现细节（有长度上限）', async () => {
+  const { entries } = await readChangelog()
+  const tooLong = entries
+    .filter((entry) => entry.body.length > MAX_ENTRY_CHARS)
+    .map((entry) => `第 ${entry.line} 行（v${entry.version}）${entry.body.length} 字符：${entry.body.slice(0, 40)}…`)
+  assert.deepEqual(tooLong, [],
+    `以下条目超过 ${MAX_ENTRY_CHARS} 字符，应压成一句话；实现细节属于代码注释与提交信息：\n${tooLong.join('\n')}`)
+})
+
+test(' 更新日志：不出现只有维护者能看懂的引用', async () => {
+  const { entries } = await readChangelog()
+  // `§` 指向已删除的设计稿、`lib/xxx.js` 是内部路径、`v0.x` 是自指版本号——
+  // 使用者读发布日志时都不需要它们，出现即说明这条在写实现而不是写变更。
+  const banned = /\u00a7|lib\/|test\/|scripts\/|assets\/|src\/|v0\.\d+/
+  const offenders = entries
+    .filter((entry) => banned.test(entry.body))
+    .map((entry) => `第 ${entry.line} 行：${entry.body.slice(0, 60)}`)
+  assert.deepEqual(offenders, [],
+    `以下条目引用了内部路径、章节号或旧版本号：\n${offenders.join('\n')}`)
+})
+
+test(' 版本号纪律：package.json 的 version == 最新小节 + ".0"', async () => {
+  const { releases } = await readChangelog()
+  assert.ok(releases.length > 0, '没找到任何版本小节，无法与 package.json 对账')
+  const newest = releases[0].version
   const pkg = JSON.parse(await readFile(join(REPO, 'package.json'), 'utf8'))
-  assert.equal(pkg.version, `${header}.0`, `package.json 的 version 是 ${pkg.version}，表头是 v${header}，应写作 ${header}.0`)
+  assert.equal(pkg.version, `${newest}.0`,
+    `package.json 的 version 是 ${pkg.version}，最新小节是 ${newest}，应写作 ${newest}.0`)
 })

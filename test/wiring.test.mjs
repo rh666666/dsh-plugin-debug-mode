@@ -17,7 +17,7 @@ import { apply, SECTION_NAME, SECTION_ORDER } from '../lib/index.js'
 import { registerDebugCommand, COMMAND_NAME } from '../lib/command.js'
 import { ROUTE_PREFIX, registerRoutes } from '../lib/routes.js'
 import { DebugService } from '../lib/debug-service.js'
-import { debugCommandInstruction, debugGuidance } from '../lib/prompt.js'
+import { debugGuidance, debugSignalGuidance, debugTicketGuidance } from '../lib/prompt.js'
 import { createAgent, createArtifactBase, createFakeContext, createWorkspace } from './helpers.mjs'
 
 const SESSION = 'session-aaaa'
@@ -133,7 +133,7 @@ test('debugGuidance：无任务必须返回空串（否则没进调试的会话�
   assert.ok(!/只读取证轮/.test(second), '第 2 轮起不该再说"不许改代码"')
 })
 
-test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模型，所以必须主动投递）', async () => {
+test('/debug 命令：签票 + 把**用户原话**开成一轮对话（指令走 systemPrompt 注入，不进消息）', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
   const art = await createArtifactBase()
   const fake = createFakeContext({ cwd: workspace.root })
@@ -149,7 +149,7 @@ test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模
     assert.equal(fake.prompts.length, 0)
     const result = await fake.commands[0].handler({
       agent,
-      rawInput: '点了保存列表不刷新',
+      rawInput: '  点了保存列表不刷新\n',
       commandId: 'c1',
       attachments: [],
     })
@@ -160,25 +160,28 @@ test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模
     assert.match(result.text, /已进入调试模式/)
     assert.match(result.text, /本轮已开始/)
 
-    // ② 真正让 Agent 动起来的是这一轮投递，指令 + 用户描述原文都在里面。
+    // ② 真正让 Agent 动起来的是这一轮投递，而它的内容**就是用户的原话**。
+    // 这是本次修复的核心：指令不再以用户消息的形态出现（那会在对话里伪造一段
+    // 用户"没说过"的话，还把描述埋在引用块里）。形态对齐 Plan 模式：
+    // 模式态走 section、用户输入走消息。
     assert.equal(fake.prompts.length, 1, '必须开出一轮对话，否则用户敲完命令什么都不会发生')
     const turn = fake.prompts[0]
     assert.equal(turn.sessionId, SESSION)
     assert.equal(turn.mode, 'queue', 'queue = 空闲时开一轮、忙时排队；steer 只在运行中有效')
     assert.ok(turn.requestId, 'requestId 是宿主的幂等键，必须给')
-    const text = turn.content.map((part) => part.text).join('')
-    assert.match(text, /点了保存列表不刷新/, '用户描述必须原样进这一轮（它是数据，不是指令）')
-    assert.match(text, /dsh_debug_start/)
-    assert.match(text, /不要调用 `dsh_debug_start`/, '必须告诉 Agent"一眼看出根因就别进调试"')
-    // (*) 本次修复的核心：不许再等用户补一句「开始」。
-    assert.match(text, /这一轮就是完整的请求/, '必须明说这就是完整请求')
-    assert.match(text, /不要等用户再说一句「开始」/)
+    assert.equal(turn.content.length, 1, '一轮里只该有那一条用户消息')
+    // 逐字相等（只 trim 首尾空白）：中间一个字符都不许被改写。
+    assert.equal(turn.content[0].text, '点了保存列表不刷新')
+    // 插件指令一个字都不许混进用户消息：它现在住在 systemPrompt 里。
+    assert.doesNotMatch(turn.content[0].text, /dsh_debug_start/)
+    assert.doesNotMatch(turn.content[0].text, /debug-mode/)
+    assert.doesNotMatch(turn.content[0].text, /门票|这一轮就是完整的请求/)
 
-    // 票据确实签出来了。
+    // 票据确实签出来了（`start` 的硬校验靠它，与消息内容无关）。
     const ticket = await service.peekTicket(SESSION, workspace.root)
     assert.ok(ticket && ticket.text === '点了保存列表不刷新')
 
-    // 没写描述时也要开一轮：让 Agent 主动问，而不是卡住。
+    // 没写描述时**不投递**（不伪造一条用户发言），如实告诉用户下一步。
     const noText = createFakeContext({ cwd: workspace.root })
     const service2 = new DebugService(noText.ctx, { logger: noText.ctx.logger, tempDir: art.base })
     registerDebugCommand(noText.ctx, service2)
@@ -187,9 +190,10 @@ test('/debug 命令：签票 + **开一轮对话**（命令的返回值不进模
       rawInput: '   ',
     })
     assert.equal(empty.kind, 'success')
-    assert.match(empty.text, /会先问你现象与复现路径/)
-    assert.equal(noText.prompts.length, 1)
-    assert.match(noText.prompts[0].content[0].text, /请先用一句话向用户确认现象/)
+    assert.match(empty.text, /直接描述现象|直接在输入框里说现象/)
+    assert.equal(noText.prompts.length, 0, '空描述不能凭空开一轮（宿主也拒绝空内容）')
+    // 票照签：用户下一条消息就是描述。
+    assert.ok(await service2.peekTicket('session-empty', workspace.root))
 
     // 已有活跃任务时，命令必须拒绝并点名既有哈希。
     await service.start({ sessionId: SESSION, goal: 'g', workspace: workspace.root })
@@ -231,10 +235,46 @@ test('/debug 投递失败时必须如实说，并告诉用户"直接发描述就
   }
 })
 
-test('debugCommandInstruction 在用户没写描述时仍然可执行（不猜现象）', () => {
-  const text = debugCommandInstruction({ text: '', expiresInMinutes: 30 })
-  assert.match(text, /请先用一句话向用户确认现象/)
-  assert.match(text, /30 分钟/)
+test('debugSignalGuidance：两支正文各自说清该做什么，且都不含用户原话', () => {
+  const closing = debugSignalGuidance({ verdict: 'resolved', hash: 'deadbeef', anytime: false })
+  assert.match(closing, /用户表态：问题已解决/)
+  assert.match(closing, /dsh_debug_end/)
+  assert.match(closing, /git checkout/, '收尾段必须明令禁止整体回滚')
+  assert.ok(!/假装验证过/.test(closing), '正常窗口里不该带"别假装验证过"（那是 anytime 才需要的）')
+
+  const chipClosing = debugSignalGuidance({ verdict: 'resolved', hash: 'deadbeef', anytime: true })
+  assert.match(chipClosing, /verified/)
+  assert.match(chipClosing, /假装验证过/)
+
+  const again = debugSignalGuidance({ verdict: 'reproduced', hash: 'deadbeef', round: 2 })
+  assert.match(again, /第 2 轮/)
+  assert.match(again, /dsh_debug_read/)
+  assert.match(again, /dsh_debug_continue/)
+  assert.match(again, /日志完整保留/, '复现信号必须点明日志还在（历史上写反过）')
+  // 两支都要重复"复现是用户的事"：这条纪律不能因为换了分支就消失。
+  assert.match(closing, /复现是用户的事/)
+  assert.match(again, /复现是用户的事/)
+  // 指令里不得出现用户输入的任何片段（它是注入段，不是用户消息）。
+  assert.ok(!closing.includes('deadbeef的额外文本'))
+})
+
+test('debugTicketGuidance：持票期的指令正文（不含用户描述、A/B 两条路、有效期）', () => {
+  const withText = debugTicketGuidance({ expiresInMinutes: 30, hasUserText: true })
+  assert.match(withText, /调试模式/)
+  assert.match(withText, /dsh_debug_start/)
+  assert.match(withText, /不要调用 `dsh_debug_start`/, '必须告诉 Agent"一眼看出根因就别进调试"')
+  assert.match(withText, /30 分钟/)
+  assert.match(withText, /原样抄用户那条消息/)
+  assert.match(withText, /dsh_debug_continue/, '已有任务时要指向 continue 而不是新开')
+  assert.ok(!/没有写描述/.test(withText), '用户写了描述时不该再说"没写描述"')
+
+  // 空描述那一支：要求它先问清现象，而不是猜。
+  const noText = debugTicketGuidance({ expiresInMinutes: 30, hasUserText: false })
+  assert.match(noText, /没有写描述/)
+  assert.match(noText, /问清现象/)
+
+  // 条件块必须按行拼进去，不能被 join 变成"A,B"。
+  assert.ok(!/；,/.test(withText) && !/，,/.test(noText))
 })
 
 test('路由：/state 无任务也要 200；缺参数 400；/resolve 未知 hash 404；非 POST 405', async () => {
@@ -376,8 +416,10 @@ test('路由：/reproduce 把用户选择变成 Agent 的下一轮输入（并�
     assert.equal(first.json.ok, true)
     assert.equal(first.json.delivered, true)
     assert.equal(fake.prompts.length, 1)
-    assert.match(fake.prompts[0].content[0].text, /问题复现/)
-    assert.match(fake.prompts[0].content[0].text, /只在切换标签页后复现/, 'note 必须随指令一起投给 Agent')
+    // 用户补的那句话就是这一轮的全部内容；指令改由 systemPrompt 注入。
+    assert.equal(fake.prompts[0].content[0].text, '只在切换标签页后复现')
+    assert.equal(fake.prompts[0].content.length, 1)
+    assert.ok(!/dsh_debug_read/.test(fake.prompts[0].content[0].text), '指令不许混进用户消息')
 
     const second = await call()
     assert.equal(second.status, 200)
@@ -439,12 +481,30 @@ test('apply 装配：一个命令 + 六条路由；每个 agent 拿到 5 个工�
     assert.equal(section.name, SECTION_NAME)
     assert.equal(section.order, SECTION_ORDER)
     assert.equal(typeof section.text, 'function', 'text 必须是 thunk')
-    assert.equal(section.text({}), '', '没有活跃任务时必须注入空串')
+    assert.equal(section.text({}), '', '没有活跃任务也没有门票时必须注入空串')
 
-    await service.issueTicket({ sessionId: SESSION, text: 'x', workspace: workspace.root })
-    const started = await service.start({ sessionId: SESSION, goal: 'x', workspace: workspace.root })
+    // (*) 本次改动的核心：**持票期**就该有正文——调试指令不再以用户消息的形态出现，
+    // 它必须由这一段承载（否则 /debug 之后模型什么都拿不到，又回到"要用户补一句开始"）。
+    await service.issueTicket({ sessionId: SESSION, text: '音频解码偶尔崩', workspace: workspace.root })
+    const ticketed = section.text({})
+    assert.match(ticketed, /持票中/, '持票期必须有指令正文')
+    assert.match(ticketed, /dsh_debug_start/)
+    assert.match(ticketed, /不要调用 `dsh_debug_start`/, 'A/B 两条路要在注入段里')
+    assert.ok(!ticketed.includes('音频解码偶尔崩'), '用户描述不进注入段（它就是那条用户消息）')
+    assert.equal(typeof ticketed, 'string', 'thunk 必须同步返回字符串，不能是 Promise')
+
+    // 过期的票等于没有票：注入段必须自己收回去（否则 30 分钟后的每一轮都还写着"已授权"）。
+    const liveTicket = service.tickets.get(SESSION)
+    const issuedAt = liveTicket.issuedAt
+    liveTicket.issuedAt = Date.now() - 31 * 60 * 1000
+    assert.equal(section.text({}), '', '过期票据不该再注入指令')
+    liveTicket.issuedAt = issuedAt
+    assert.match(section.text({}), /持票中/)
+
+    const started = await service.start({ sessionId: SESSION, goal: '音频解码偶尔崩', workspace: workspace.root })
     const withTask = section.text({})
     assert.match(withTask, /调试模式/)
+    assert.ok(!/持票中/.test(withTask), '建任务之后票据被消费，段落必须换成任务态')
     assert.equal(withTask.includes('deadbeef'), false)
     assert.match(withTask, /任务 [0-9a-f]{8}/, '任务活跃时必须真的给出准则')
 
@@ -470,6 +530,21 @@ test('apply 装配：一个命令 + 六条路由；每个 agent 拿到 5 个工�
     assert.equal(service.tasks.get(SESSION).status, 'awaiting-user')
     fake.emit('session/event', { header: { id: SESSION } }, { type: 'user/message' })
     assert.equal(service.tasks.get(SESSION).status, 'active')
+
+    // [!] 用户表态那一支：段落必须换成"该收尾了"，而**用户消息里只有他自己那句话**。
+    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '交卷' })
+    const beforeVerdict = fake.prompts.length
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+    const closing = section.text({})
+    assert.match(closing, /用户表态：问题已解决/, '表态后注入段必须讲收尾，而不是继续讲埋点')
+    assert.match(closing, /dsh_debug_end/)
+    assert.ok(!/只读取证轮/.test(closing), '收尾那一支不该再讲取证纪律')
+    // 投出去的那条用户消息 = 按钮文案本身（用户没补话）。
+    assert.equal(fake.prompts.length, beforeVerdict + 1)
+    assert.equal(fake.prompts.at(-1).content[0].text, '问题已解决')
+    // 收尾完成后段落回到空串。
+    await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(section.text({}), '')
   } finally {
     if (previousTmp === undefined) delete process.env.DSH_DEBUG_MODE_TMP
     else process.env.DSH_DEBUG_MODE_TMP = previousTmp

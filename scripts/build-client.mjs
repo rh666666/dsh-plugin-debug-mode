@@ -7,7 +7,7 @@
  * 上线必死。详。
  *
  * 为什么不用 esbuild/rollup：客户端半只有一两个文件，而引入打包器会带来
- * node_modules、锁文件与版本漂移——本项目的工程纪律是零运行时依赖（AGENTS.md §4.1）。
+ * node_modules、锁文件与版本漂移——本项目的工程纪律是零运行时依赖。
  * 这个脚本只做四件确定性的事：校验导入白名单 → 改写 import/export → 套外壳 → 写文件。
  *
  * 用法：node scripts/build-client.mjs
@@ -112,7 +112,7 @@ const indented = body
 const banner = [
   '// 本文件由 scripts/build-client.mjs 生成，请勿手改。',
   `// 源码：src/client.js · 平台模块：${names.join(', ') || '（无）'}`,
-  `// 生成时间不写入产物（保证同输入同字节，便于 diff 审阅）。`,
+  '// 生成时间不写入产物（保证同输入同字节，便于 diff 审阅）。',
   '',
 ].join('\n')
 

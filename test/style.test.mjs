@@ -1,5 +1,5 @@
 /**
- * test/style.test.mjs —— 文本风格守卫：仓库里任何文本文件都不带 emoji（AGENTS.md §4.4）。
+ * test/style.test.mjs —— 文本风格守卫：仓库里任何文本文件都不带 emoji。
  *
  * 为什么值得一条独立的测试：终端 / 编辑器 / CI 的编码与字形回退各不相同，emoji 在其中
  * 任何一环都可能变成乱码，甚至只剩半个代理对（复制、截断、换行各拆一次就够了）。排查一次
@@ -24,7 +24,7 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SKIP_DIRS = new Set(['.git', 'node_modules'])
 
 /**
- * 禁用字符（AGENTS.md §4.4 的判定范围）。分两条写，因为**代理对**必须按 UTF-16 码元匹配：
+ * 禁用字符的判定范围。分两条写，因为**代理对**必须按 UTF-16 码元匹配：
  * 一旦加上 `u` 标志，字符串里的代理对被当成一个码点，`[\uD83C]` 就再也匹配不到它的首元，
  * U+1F000–U+1FAFF 这一片会整个漏掉。
  */
@@ -69,7 +69,7 @@ function findBannedCharacters(text) {
   return hits.sort((left, right) => left.line - right.line)
 }
 
-test('文本风格：仓库里任何文本文件都不带 emoji（AGENTS.md §4.4）', async () => {
+test('文本风格：仓库里任何文本文件都不带 emoji', async () => {
   const files = await collectFiles(REPO)
   const offenders = []
   let scanned = 0
