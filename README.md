@@ -1,6 +1,7 @@
 # dsh-plugin-debug-mode
 
-`github:rh666666/dsh-plugin-debug-mode` · <https://github.com/rh666666/dsh-plugin-debug-mode>
+npm：`dsh-plugin-debug-mode` · npmjs.com/package/dsh-plugin-debug-mode
+GitHub：<https://github.com/rh666666/dsh-plugin-debug-mode>
 
 > DSH（DeepSeek Harness）插件：**Cursor Agent 式的 Debug 模式**。
 > 让 Agent 别猜——它自己在你的代码里埋探针，把现场取回来；你复现一次，然后二选一。
@@ -211,41 +212,50 @@ total 在 items 为空时算成了 null
 
 ## 状态
 
-**v0.19 · M0–M6 + R1–R6 + HTTP 探针通道全部落地，全部测试全绿**：
-`/debug` 与票据闸门、5 个信号工具、日志管道与摘要、唤醒闭环、交互面板、收尾对账、
-防堆屎山机制（R1 工作区索引 + 窗口 diff、残留扫描与隔离区、停止规则、欠账看板）
-全部就位；浏览器/远程运行时的 HTTP 探针通道也已补齐，**整条流程不依赖任何命令**。
+**v0.21 · 全部测试全绿**：`/debug` 与票据闸门、5 个信号工具、日志管道与摘要、唤醒闭环、
+交互面板、收尾对账、防堆屎山机制（工作区索引 + 窗口 diff、残留扫描与隔离区、停止规则、
+欠账看板）全部就位；浏览器/远程运行时的 HTTP 探针通道也已补齐，**整条流程不依赖任何命令**。
 
 唯一还没做的是**人在真实 GUI 里点一次面板**——那一步只有你能做。
 
-先读 [CHANGELOG.md](./CHANGELOG.md)（只追加的变更记录）与
-[AGENTS.md](./AGENTS.md)（唯一权威入口：契约、纪律、被推翻的机制都在那儿）。
+变更见 [CHANGELOG.md](./CHANGELOG.md)，开发纪律见 [AGENTS.md](./AGENTS.md)。
 
 ## 安装
 
-**从 GitHub 直装**（仓库已推送；npm 上目前还没有这个包名）：
+**推荐：在 DSH 的插件管理界面里装。**
+
+打开侧边栏的**插件**页，在安装框里输入包名即可：
+
+```
+dsh-plugin-debug-mode
+```
+
+它会按当前 DSH 版本去注册表取包（默认 npm，取不到时自动换镜像源），装完即生效；
+如果有依赖需要构建脚本，页面会把待批的包名列出来，确认后再装。
+
+**命令行等价做法**：
 
 ```bash
+dsh plugin --profile web add dsh-plugin-debug-mode
+```
+
+需要装指定版本时在包名后加版本号，例如 `dsh-plugin-debug-mode@0.21.0`。
+
+**其它渠道**：
+
+```bash
+# GitHub 直装
 dsh plugin --profile web add github:rh666666/dsh-plugin-debug-mode
-```
 
-另一种写法（标准 git 规范，不依赖 `github:` 简写）：
-
-```bash
-dsh plugin --profile web add git+https://github.com/rh666666/dsh-plugin-debug-mode.git
-```
-
-GitHub 拉不动时，克隆到本地再挂载：
-
-```bash
+# 克隆到本地再挂载（改代码调试时最方便）
 git clone https://github.com/rh666666/dsh-plugin-debug-mode.git
 dsh plugin --profile web add link:<克隆下来的目录绝对路径>
 ```
 
 **安装期不需要构建，也不需要 `node_modules`**：本插件零运行时依赖，而且
-`lib/client.js` 是**提交进 git 的生成物**——仓库里已经带着它，所以 git 直装与
-`link:` 本地挂载拿到的东西是一样的，不必先跑构建脚本（只有你改了 `src/client.js`
-才需要重跑 `scripts/build-client.mjs`，见下面的「开发」）。
+`lib/client.js` 是**提交进 git 的生成物**——仓库里已经带着它，所以从 npm 装、从 git 装、
+`link:` 本地挂载拿到的东西是一样的（只有你改了 `src/client.js` 才需要重跑
+`scripts/build-client.mjs`，见下面的「开发」）。
 
 装完在任意会话里敲 `/debug <现象描述>` 即可——命令会自动出现在宿主的命令面板里。
 
