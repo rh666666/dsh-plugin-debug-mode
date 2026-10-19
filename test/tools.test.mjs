@@ -205,6 +205,44 @@ test('每个工具的返回值都通得过自己的 output.schema（否则宿主
   }
 })
 
+test('工具边界会剥掉值为 undefined 的字段（否则宿主判成非 lossless JSON）', async () => {
+  const definitions = Object.fromEntries(toolDefinitions({
+    end: async () => ({
+      ok: true,
+      hash: 'deadbeef',
+      round: 1,
+      status: 'closed',
+      cleanedFiles: [],
+      scanIncomplete: false,
+      incompleteReasons: undefined,
+      text: '收工',
+    }),
+  }).map((tool) => [tool.name, tool]))
+
+  const exec = {
+    agent: { id: 'session-x', session: { header: { id: 'session-x', cwd: process.cwd() } } },
+  }
+  const value = await definitions.dsh_debug_end.execute({ summary: '收工' }, exec)
+  assert.equal(value.ok, true)
+  assert.equal(value.text, '收工')
+  assert.equal('incompleteReasons' in value, false, 'undefined 自有键必须被剥掉')
+  assertLosslessJson(value)
+})
+
+test('工具边界对无法 JSON 化的返回值给出可读错误', async () => {
+  const circular = { ok: true, text: '正文' }
+  circular.self = circular
+  const definitions = Object.fromEntries(toolDefinitions({ end: async () => circular })
+    .map((tool) => [tool.name, tool]))
+  const exec = {
+    agent: { id: 'session-x', session: { header: { id: 'session-x', cwd: process.cwd() } } },
+  }
+  const value = await definitions.dsh_debug_end.execute({ summary: '收工' }, exec)
+  assert.equal(value.ok, false)
+  assert.match(value.text, /无法序列化为 JSON/)
+  assertLosslessJson(value)
+})
+
 test('工具在缺少 args / 缺少 agent 时给出可读返回值而不是抛异常', async () => {
   const art = await createArtifactBase()
   const fake = createFakeContext()
