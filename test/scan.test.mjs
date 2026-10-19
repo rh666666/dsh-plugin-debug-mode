@@ -22,8 +22,10 @@ import {
   findMarkers,
   planCleanup,
   removeBlocks,
+  scanPaths,
   scanResidue,
   verifySyntax,
+  walkSourceFiles,
 } from '../lib/scan.js'
 import { createWorkspace, probeBlock } from './helpers.mjs'
 
@@ -310,6 +312,152 @@ test('indexWorkspace 排除 .dsh/node_modules/.git，并返回截断标记而不
 
     const limited = await indexWorkspace(workspace.root, { maxFiles: 0 })
     assert.equal(limited.truncated, true, '截断必须能被调用方看见（第 2 条）')
+    assert.match(String(limited.truncatedReason), /文件数预算/)
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('indexWorkspace：大文件进索引（hash 为 null）而不是被丢掉；stat 没变就不重算指纹', async () => {
+  // 注意扩展名必须在 `TEXT_EXTENSIONS` 里，否则它压根不是候选文件（那是另一条规则）。
+  const big = `${'  "k": 1,\n'.repeat(60_000)}` // 约 540 KiB，超过单文件扫描上限
+  const workspace = await createWorkspace({
+    'src/app.js': 'export const a = 1\n',
+    'data/big.json': `{\n${big}}\n`,
+  })
+  try {
+    const first = await indexWorkspace(workspace.root)
+    // [x] 老实现 `if (info.size > MAX) continue` 把大文件**从索引里删掉**，于是它永远
+    // 不会出现在 diff 里——"改了 5 MB 的 lockfile"这种改动根本检测不到。
+    assert.ok('data/big.json' in first.entries, '大文件必须进索引，只是不算指纹')
+    assert.equal(first.entries['data/big.json'].hash, null)
+    assert.ok(first.entries['src/app.js'].hash)
+
+    // 第二遍带上基线：内容哈希应当被复用（同一个值），且不重新读文件内容。
+    const second = await indexWorkspace(workspace.root, { previous: first.entries })
+    assert.equal(second.entries['src/app.js'].hash, first.entries['src/app.js'].hash)
+    assert.equal(second.entries['data/big.json'].hash, null)
+
+    // 只动 mtime 不改内容：指纹照样复用，diff 会判它没变。
+    const touched = await indexWorkspace(workspace.root, { previous: first.entries })
+    assert.equal(diffIndex(first.entries, touched).changed.length, 0)
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('diffIndex：没有内容指纹时按 stat 判改动（大文件也不再漏检）', () => {
+  const before = { 'a.json': { size: 10, mtimeMs: 1, hash: null } }
+  const after = { 'a.json': { size: 12, mtimeMs: 1, hash: null } }
+  assert.deepEqual(diffIndex(before, after).changed, ['a.json'])
+
+  const sameSize = { 'a.json': { size: 10, mtimeMs: 99, hash: null } }
+  assert.deepEqual(diffIndex(before, sameSize).changed, ['a.json'], 'mtime 变了也算改过')
+
+  const untouched = { 'a.json': { size: 10, mtimeMs: 1, hash: null } }
+  assert.deepEqual(diffIndex(before, untouched).changed, [])
+})
+
+test('walkSourceFiles：生成物目录被排除并记账，时间预算到顶也置 truncated', async () => {
+  const workspace = await createWorkspace({
+    'src/app.js': 'export const a = 1\n',
+    'dist/bundle.js': 'x\n',
+    'node_modules/pkg/index.js': 'x\n',
+    'coverage/lcov.info': 'x\n',
+  })
+  try {
+    const walked = await walkSourceFiles(workspace.root)
+    assert.deepEqual(walked.files.map((file) => file.split(/[\\/]/).pop()), ['app.js'])
+    assert.equal(walked.truncated, false)
+    assert.ok(walked.skippedDirs.some((dir) => dir.endsWith('dist')), '被跳过的目录要记账')
+
+    const noTime = await walkSourceFiles(workspace.root, { budgetMs: -1 })
+    assert.equal(noTime.truncated, true)
+    assert.match(String(noTime.truncatedReason), /时间预算/)
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('scanResidue：发现遍历被截断时 complete=false，但**报备过的文件照样被完整扫描**', async () => {
+  // 真实场景：几万个文件的仓库，探针埋在遍历预算之外。
+  // 老实现下这次收尾会返回"没有残留"——那是本插件最糟的一种失败（静默漏删）。
+  const workspace = await createWorkspace({
+    'src/owned.js': `const a = 1\n${probeBlock(HASH, "probe('owned')")}\nexport default a\n`,
+    // 大到超过发现路径的单文件上限：不报备就永远扫不到。
+    'data/huge.js': `${probeBlock(HASH, "probe('huge')")}\n${'// padding\n'.repeat(60_000)}`,
+    'dist/generated.js': `// dsh-debug:probe ${HASH} start\nprobe('built')\n// dsh-debug:probe ${HASH} end\n`,
+    'src/other.js': 'export const other = 1\n',
+  })
+  try {
+    // ① 没有报备：发现路径被预算卡死，超大文件被跳过，`dist/` 被排除。
+    const blind = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH], maxFiles: 1 })
+    assert.equal(blind.complete, false, '截断必须让 complete 为假（否则收尾会宣称干净）')
+    assert.match(String(blind.truncatedReason), /文件数预算/)
+    assert.ok(blind.skipped > 0 || blind.truncated)
+
+    // ② 报了 `data/huge.js`：它被完整扫描，且**不受**大小上限与预算约束。
+    const declared = await scanResidue(workspace.root, {
+      hash: HASH,
+      knownHashes: [HASH],
+      priority: ['data/huge.js'],
+      maxFiles: 1,
+    })
+    assert.deepEqual(declared.targetFiles, ['data/huge.js'],
+      '报备过的文件必须出现在残留清单里，哪怕它超大、哪怕遍历被截断')
+    assert.equal(declared.priorityScanned, 1)
+    assert.equal(declared.complete, false, '发现仍然不完整，这一点必须如实保留')
+
+    // ③ 报备了 dist/ 里的文件：跳过目录也不影响"声明优先"。
+    //    此时发现路径也把 src/owned.js 扫到了（默认预算足够），所以它一并出现——
+    //    这条断言只钉"报备的 dist 文件确实被读到"，不假设发现路径扫不到什么。
+    const fromDist = await scanResidue(workspace.root, {
+      hash: HASH,
+      knownHashes: [HASH],
+      priority: ['dist/generated.js'],
+      maxFiles: 1,
+    })
+    assert.ok(fromDist.targetFiles.includes('dist/generated.js'),
+      '被 skipDirs 排除的目录里的报备文件也必须被扫描')
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('scanPaths：声明过但读不到的文件进 unreadable（收尾不得据此宣称干净）', async () => {
+  const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  try {
+    const result = await scanPaths(workspace.root, ['src/app.js', 'src/missing.js'], { hash: HASH, knownHashes: [HASH] })
+    assert.equal(result.scanned, 1)
+    assert.deepEqual(result.unreadable.map((entry) => entry.path), ['src/missing.js'])
+    assert.match(result.unreadable[0].error, /ENOENT/)
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('scanPaths 与 scanResidue 对同一文件给出逐字段一致的分类（口径只有一份）', async () => {
+  const source = [
+    'const a = 1',
+    probeBlock(HASH, "probe('x')"),
+    `// dsh-debug:fix ${HASH} 修复：保留我`,
+    'const b = 2',
+  ].join('\n')
+  const workspace = await createWorkspace({ 'src/app.js': source })
+  try {
+    const viaPaths = await scanPaths(workspace.root, ['src/app.js'], { hash: HASH, knownHashes: [HASH] })
+    const viaWalk = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH] })
+    const pick = (entry) => ({
+      path: entry.path,
+      hasTargetBlocks: entry.hasTargetBlocks,
+      markers: entry.markers.map((marker) => [marker.line, marker.kind, marker.hash, marker.edge]),
+      blocks: entry.blocks,
+      unresolved: entry.unresolved,
+      changeMarkers: entry.changeMarkers,
+      foreignHashes: entry.foreignHashes,
+      stubRefs: entry.stubRefs,
+    })
+    assert.deepEqual(pick(viaPaths.affected[0]), pick(viaWalk.affected[0]))
   } finally {
     await workspace.cleanup()
   }

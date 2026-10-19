@@ -650,7 +650,7 @@ test('宿主说"残留检测未生效"时，面板必须把它显示出来（绝
     hash: 'deadbeef',
     round: 1,
     status: 'awaiting-user',
-    detector: { available: false, writeProbe: false, writeProbeError: 'EACCES' },
+    detector: { available: false, writeProbe: false, writeProbeError: 'EACCES', coverage: 'unavailable' },
   }
 
   const originalFetch = globalThis.fetch
@@ -664,13 +664,42 @@ test('宿主说"残留检测未生效"时，面板必须把它显示出来（绝
     // 反例：检测可用时不该出现这条告警（否则用户会习惯性忽略它）。
     globalThis.fetch = async () => ({
       ok: true,
-      json: async () => ({ task: { ...task, detector: { available: true, writeProbe: true } } }),
+      json: async () => ({ task: { ...task, detector: { available: true, writeProbe: true, coverage: 'full' } } }),
     })
     const healthy = await react.run(() => panel({
       sessionId: 's1',
       useInput: () => ({ draft: '' }),
     }))
     assert.ok(!/残留检测未生效/.test(collectText(healthy).join('\n')))
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('大仓库（发现不完整）与"根本写不进去"必须分开说：partial 不等于 unavailable', async () => {
+  const { exportsObject } = await loadExports()
+  const { panel } = mountPanel(exportsObject)
+  // 根是可写的，只是仓库太大：报备过的探针照样会被摘除，措辞不能说成"没在保护"。
+  const task = {
+    hash: 'deadbeef',
+    round: 2,
+    status: 'awaiting-user',
+    detector: {
+      available: true,
+      writeProbe: true,
+      coverage: 'partial',
+      truncated: true,
+      truncatedReason: '文件数预算 20000 到顶',
+    },
+  }
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
+  try {
+    const text = collectText(await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))).join('\n')
+    assert.match(text, /只覆盖了一部分/)
+    assert.match(text, /已报备的探针仍会被完整摘除/)
+    assert.ok(!/残留检测未生效/.test(text), 'partial 不许复用 unavailable 的文案（那是两件事）')
   } finally {
     globalThis.fetch = originalFetch
   }

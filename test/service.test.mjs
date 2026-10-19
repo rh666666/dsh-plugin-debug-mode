@@ -23,6 +23,7 @@ import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 
 import { ARTIFACT_ROOT, DebugService } from '../lib/debug-service.js'
+import { scanResidue } from '../lib/scan.js'
 import { createHash } from '../lib/task.js'
 import {
   createArtifactBase,
@@ -39,7 +40,7 @@ const OTHER_SESSION = 'session-bbbb'
 /**
  * 起一个服务 + 临时工作区 + **自己的产物根父目录**。
  * @param {Record<string, string>} [files]
- * @param {{ tempDir?: string, webPort?: number, createHash?: () => string }} [options]
+ * @param {{ tempDir?: string, webPort?: number, createHash?: () => string, scanMaxFiles?: number }} [options]
  */
 async function setup(files = {}, options = {}) {
   const workspace = await createWorkspace({
@@ -53,6 +54,7 @@ async function setup(files = {}, options = {}) {
     logger: fake.ctx.logger,
     tempDir: options.tempDir ?? art.base,
     ...(options.createHash ? { createHash: options.createHash } : {}),
+    ...(options.scanMaxFiles !== undefined ? { scanMaxFiles: options.scanMaxFiles } : {}),
   })
   return { service, fake, workspace, art }
 }
@@ -440,6 +442,7 @@ test('S5/S7：未经用户表态 end 被拒；resolve 幂等只唤醒一次；en
     assert.equal(ended.ok, true, ended.text)
     assert.deepEqual(ended.cleanedFiles, ['src/app.js'])
     assert.deepEqual(ended.residualFiles, [])
+    assert.equal(ended.scanIncomplete, false, '干净收尾不该带 incomplete 标记')
 
     const after = await readFile(sourcePath, 'utf8')
     assert.ok(!after.includes('dsh-debug:probe'), '探针块必须摘干净')
@@ -1053,6 +1056,165 @@ test('产物根 ⑦：哈希目录已存在就换一个（临时根是全局共�
     assert.notEqual(started.hash, taken, '撞上了就必须换一个哈希，否则会盖掉另一个任务的日志与 state.json')
     assert.match(started.hash, /^[0-9a-f]{8}$/)
     assert.equal(calls, 2, '第一次撞、第二次才成')
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('大仓库收尾：报备的探针照样被摘除，但发现不完整时**不宣称干净、也不删证据**', async () => {
+  // 这条测试守的是本插件最糟的一种失败：遍历被预算截断 ⇒ 复扫"没发现残留" ⇒
+  // 返回 residualFiles: [] ⇒ 模型据此告诉用户"已清理干净"。实际探针还在代码里。
+  //
+  // 场景：探针埋在遍历预算之外（maxFiles=1），而且是被报备过的。
+  const { service, workspace, art } = await setup({
+    'src/owned.js': 'export const a = 1\n',
+    // 一个真实的大文件，确保发现路径会跳过它（>512 KiB）。
+    'data/bulk.js': `${'// padding\n'.repeat(60_000)}\nexport const bulk = 1\n`,
+  }, { scanMaxFiles: 1 })
+  try {
+    const started = await startTask(service, workspace)
+    await workspace.write('src/owned.js', [
+      'const items = []',
+      probeBlock(started.hash, "probe('src/owned.js:1:items')"),
+      'export function total() { return items.length }',
+    ].join('\n'))
+
+    const reported = await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '空数组分支',
+      probeFiles: ['src/owned.js'],
+      headline: '看看 items',
+    })
+    assert.equal(reported.ok, true, reported.text)
+    assert.equal(reported.scanIncomplete, true, '遍历被截断时必须如实标记')
+    assert.match(reported.text, /已被逐个完整扫描/, '必须说清"报备的文件不受影响"')
+
+    const task = service.tasks.get(SESSION)
+    assert.equal(task.scanCoverage.complete, false)
+    assert.equal(task.scanCoverage.priorityCount, 1)
+
+    // 面板三态：partial，不是 unavailable（根是可写的）。
+    const state = await service.panelState(SESSION)
+    assert.equal(state.task.detector.coverage, 'partial')
+
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+    const ended = await service.end({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      summary: '收工',
+      cleanedFiles: ['src/owned.js'],
+    })
+
+    // ① 摘除本身是**成功**的：报备过 ⇒ 不受预算影响。
+    assert.ok(ended.cleanedFiles.includes('src/owned.js'))
+    const after = await readFile(join(workspace.root, 'src', 'owned.js'), 'utf8')
+    assert.ok(!after.includes('dsh-debug:probe'), '报备的探针必须被摘掉')
+
+    // ② 但结论不许干净：发现不完整 ⇒ scanIncomplete。
+    assert.equal(ended.scanIncomplete, true)
+    assert.deepEqual(ended.residualFiles, [], '残留清单本身是空的——这正是危险之处')
+
+    // ③ 首段即失败摘要（模型与用户都只读得到前面几行）。
+    const firstLine = ended.text.split('\n')[0]
+    assert.match(firstLine, /没有清干净/)
+    assert.ok(!/^调试任务 #\w+ 已结束/.test(ended.text), '不许用"已结束"打头')
+
+    // ④ 证据必须留下：日志、备份、账本都还在。
+    const dir = service.pathsOf(started).dir
+    assert.ok((await stat(join(dir, 'state.json'))).isFile(), '未清干净时必须保留任务目录')
+    assert.ok((await stat(join(dir, 'backups', 'src__owned.js'))).isFile(), '备份必须留下')
+    const residualFile = JSON.parse(await readFile(join(dir, 'residual.json'), 'utf8'))
+    assert.deepEqual(residualFile.reasons.residual, [])
+    assert.equal(residualFile.coverage.complete, false)
+
+    // ⑤ 已关闭但未清干净的任务要出现在欠账看板上（否则它永远躺在磁盘上没人看见）。
+    const board = await service.debtBoard()
+    assert.equal(board.unclean.length, 1)
+    assert.equal(board.unclean[0].hash, started.hash)
+    assert.match(await service.debtNotice('session-other'), /已关闭但收尾没清干净/)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('大仓库收尾：报备过但读不到的文件同样挡住"干净"结论', async () => {
+  const { service, workspace, art } = await setup()
+  try {
+    const started = await startTask(service, workspace)
+    await workspace.write('src/app.js', `${probeBlock(started.hash, "probe('x')")}\nexport const a = 1\n`)
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: 'x',
+      probeFiles: ['src/app.js', 'src/never-existed.js'],
+    })
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+
+    const ended = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(ended.ok, true)
+    assert.equal(ended.scanIncomplete, true, '读不到的报备文件 = 无法证明干净')
+    assert.deepEqual(ended.incompleteReasons.unreadable.map((entry) => entry.path), ['src/never-existed.js'])
+    assert.match(ended.text, /没有清干净/)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('收尾干净时任务目录照旧消失（默认路径不许被新逻辑带歪）', async () => {
+  const { service, workspace, art } = await setup()
+  try {
+    const started = await startTask(service, workspace)
+    await workspace.write('src/app.js', `${probeBlock(started.hash, "probe('x')")}\nexport const a = 1\n`)
+    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: 'x' })
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+    const ended = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+
+    assert.equal(ended.ok, true, ended.text)
+    assert.equal(ended.scanIncomplete, false)
+    assert.deepEqual(ended.residualFiles, [])
+    assert.match(ended.text.split('\n')[0], /已结束/)
+    await assert.rejects(() => stat(service.pathsOf(started).dir), '干净收尾必须删掉任务目录')
+    assert.equal((await service.debtBoard()).unclean.length, 0)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('收尾未干净的哈希不再被判成"陌生哈希"（否则同一批残留永远清不掉）', async () => {
+  const { service, workspace, art } = await setup()
+  try {
+    // 第一个任务故意留下残留：读不到的报备文件 ⇒ 目录被保留。
+    const first = await startTask(service, workspace, SESSION)
+    await workspace.write('src/left.js', `${probeBlock(first.hash, "probe('left')")}\nexport const a = 1\n`)
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: 'x',
+      probeFiles: ['src/left.js', 'src/gone.js'],
+    })
+    await service.resolve({ hash: first.hash, sessionId: SESSION })
+    const unclean = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(unclean.scanIncomplete, true)
+
+    // 模拟进程重启：内存任务表清空，但任务目录（含哈希）还在磁盘上。
+    service.tasks.clear()
+
+    // 新会话在同一个仓库开新任务：`src/left.js` 里的旧标记必须被认出来，
+    // 而不是被丢进"hash 不属于任何已知任务"的隔离区。
+    const second = await startTask(service, workspace, OTHER_SESSION)
+    assert.notEqual(second.hash, first.hash)
+    const known = await service.knownHashesFor()
+    assert.ok(known.includes(first.hash), '磁盘上的任务目录名必须算作已知哈希')
+
+    // 旧标记对当前任务来说是"别的任务"，所以不该被自动删——但它也不该被当成陌生残留。
+    const scan = await scanResidue(workspace.root, { hash: second.hash, knownHashes: known })
+    assert.ok(!scan.quarantine.some((entry) => entry.path === 'src/left.js'),
+      '已知任务的旧标记不许进隔离区（那会让用户反复回答同一个问题）')
   } finally {
     await workspace.cleanup()
     await art.cleanup()
