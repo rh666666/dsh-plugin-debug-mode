@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-debug-mode",
-  "version": "0.22.0",
+  "version": "0.22.1",
   "description": "Cursor-Agent 式调试插件：让 Agent 在代码库中埋探针取证，由你确认问题是否解决。",
   "keywords": [
     "dsh",
