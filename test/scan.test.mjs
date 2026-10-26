@@ -1,10 +1,10 @@
 /**
- * test/scan.test.mjs —— 防堆屎山那两台机器的守卫测试（R1/R2/R3）。
+ * test/scan.test.mjs —— 标记识别、配对、摘除与声明文件扫描的守卫测试。
  *
  * 这里的每一条断言都对应一个**会造成不可逆损失**的具体错误：
  *   · 误删用户代码（所以配对歧义必须进 unresolved，而不是"大概是这样"）；
  *   · 误保临时改动（所以无标记的探针不能被当成"没有"）；
- *   · 静默失效（所以截断必须能被调用方看见）。
+ *   · 留下调试记号（收尾必须连 fix/change/tmp 一起清）。
  */
 
 import assert from 'node:assert/strict'
@@ -14,18 +14,15 @@ import { test } from 'node:test'
 
 import {
   applyCleanup,
-  diffIndex,
-  findChangeMarkers,
-  indexWorkspace,
   introducedIdentifiers,
   pairBlocks,
   findMarkers,
   planCleanup,
   removeBlocks,
+  removeMarkers,
+  scanDeclared,
   scanPaths,
-  scanResidue,
   verifySyntax,
-  walkSourceFiles,
 } from '../lib/scan.js'
 import { createWorkspace, probeBlock } from './helpers.mjs'
 
@@ -50,9 +47,125 @@ test('removeBlocks 摘除本任务的 probe/temp 块，保留 fix 与用户代�
   assert.deepEqual(result.removed.map((item) => item.kind), ['probe', 'temp'])
   assert.ok(!result.text.includes('dsh-debug:probe'), '探针块必须摘干净')
   assert.ok(!result.text.includes('const tmp = 4'), 'temp 块必须摘掉')
-  assert.ok(result.text.includes('dsh-debug:fix'), 'fix 标记必须保留（那是用户的修复）')
+  assert.ok(result.text.includes('dsh-debug:fix'), 'removeBlocks 是窄口径：fix 标记保留')
   assert.ok(result.text.includes('const a = 1') && result.text.includes('const b = 2'))
   assert.deepEqual(result.unresolved, [])
+})
+
+test('removeMarkers 清掉所有类型标记：probe/temp 整块删，fix/change/tmp 只删注释', () => {
+  const source = [
+    'const a = 1',
+    probeBlock(HASH, "probe('a')"),
+    `// dsh-debug:fix ${HASH} 修复：空数组`,
+    'const b = 2',
+    `// dsh-debug:change ${HASH} 修复备注`,
+    'const c = 3',
+    '// dsh-debug:tmp',
+    'const d = 4',
+    `// dsh-debug:tmp ${HASH} start`,
+    'const tmp = 5',
+    `// dsh-debug:tmp ${HASH} end`,
+    '// dsh-debug',
+    'export default a + b + c + d',
+  ].join('\n')
+
+  const result = removeMarkers(source, HASH)
+  assert.ok(!result.text.includes('dsh-debug'), '收尾后一个 dsh-debug 记号都不许留')
+  assert.ok(!result.text.includes("probe('a')"), '探针块要整块删')
+  assert.ok(!result.text.includes('const tmp = 5'), 'temp/tmp 块要整块删')
+  assert.ok(result.text.includes('const b = 2'), 'fix 标注的代码必须保留')
+  assert.ok(result.text.includes('const c = 3'), 'change 标注的代码必须保留')
+  assert.ok(result.text.includes('const d = 4'), 'tmp 标注的代码必须保留')
+  assert.deepEqual(result.unresolved, [])
+})
+
+test('removeMarkers 保留别的任务的块（交给隔离区），但清掉行级标记', () => {
+  const source = [
+    `// dsh-debug:probe ${OTHER} start`,
+    "probe('other')",
+    `// dsh-debug:probe ${OTHER} end`,
+    `// dsh-debug:change ${OTHER} 别的任务的备注`,
+    'const keep = 1',
+  ].join('\n')
+  const result = removeMarkers(source, HASH)
+  assert.ok(result.text.includes(`dsh-debug:probe ${OTHER} start`), '别的任务的块不许动')
+  assert.ok(result.text.includes("probe('other')"), '别的任务的块体不许动')
+  assert.ok(!result.text.includes('dsh-debug:change'), '行级注释可以安全清掉')
+  assert.ok(result.text.includes('const keep = 1'))
+})
+
+test('removeMarkers 只删行尾标记注释，不删它前面的代码', () => {
+  const source = [
+    `const a = 1 // dsh-debug:fix ${HASH} 修复`,
+    `const b = 2 # dsh-debug:change ${HASH} 备注`,
+  ].join('\n')
+  assert.equal(removeMarkers(source, HASH).text, 'const a = 1\nconst b = 2')
+})
+
+test('removeMarkers 对块注释只删注释区间，保留注释后面的代码', () => {
+  const source = `const a = 1 /* dsh-debug:fix ${HASH} 修复 */ + 2\nconst b = 3 <!-- dsh-debug:tmp --> + 4\n`
+  const result = removeMarkers(source, HASH)
+  assert.equal(result.text, 'const a = 1  + 2\nconst b = 3  + 4\n')
+  assert.ok(!result.text.includes('dsh-debug'))
+})
+
+test('removeMarkers 行首块注释后面跟代码时也只删注释，不删代码', () => {
+  const source = `/* dsh-debug:fix ${HASH} 修复 */ const a = 1\n<!-- dsh-debug:tmp --> const b = 2\n`
+  const result = removeMarkers(source, HASH)
+  assert.equal(result.text, ' const a = 1\n const b = 2\n')
+  assert.ok(!result.text.includes('dsh-debug'))
+})
+
+test('块注释里含 // 时仍按块注释处理，不把后面的代码当注释截掉', () => {
+  const source = `foo(); /* see https://x dsh-debug:fix ${HASH} */ bar()\n`
+  const result = removeMarkers(source, HASH)
+  assert.equal(result.text, 'foo();  bar()\n')
+  assert.ok(!result.text.includes('dsh-debug'))
+})
+
+test('removeMarkers 不把字符串里的 dsh-debug 当标记', () => {
+  const source = `const s = 'dsh-debug:probe ${HASH} start'\nconst t = "dsh-debug:tmp"\n`
+  const result = removeMarkers(source, HASH)
+  assert.equal(result.text, source)
+  assert.deepEqual(result.removed, [])
+})
+
+test('removeMarkers 不删提到 dsh debug 的普通注释（只认真正的 marker 行）', () => {
+  const source = '// dsh debug output is noisy\nexport const a = 1\n'
+  const result = removeMarkers(source, HASH)
+  assert.equal(result.text, source)
+  assert.deepEqual(result.removed, [])
+})
+
+test('块 kind 带 hash 却缺 start/end 时不静默删：进 unresolved，等隔离区决定', () => {
+  const source = `// dsh-debug:probe ${HASH}\nprobe('x')\nexport const a = 1\n`
+  const result = removeMarkers(source, HASH)
+  assert.equal(result.text, source, '块体还在，不能只把 marker 行删掉就宣称结束')
+  assert.ok(result.unresolved.some((entry) => /缺少 start\/end/.test(entry.reason)))
+  assert.ok(pairBlocks(findMarkers(source)).unresolved.length > 0)
+})
+
+test('tmp 别名与下划线分隔也能识别成 temp 块（Agent 常写错的形态）', () => {
+  const source = [
+    `// dsh-debug:tmp_${HASH} start`,
+    'const tmp = 1',
+    `// dsh-debug:tmp_${HASH} end`,
+    'const keep = 2',
+  ].join('\n')
+  assert.equal(removeMarkers(source, HASH).text, 'const keep = 2')
+})
+
+test('removeMarkers 保留原文件的 CRLF 换行，不把整份文件改成 LF', () => {
+  const source = [
+    'const a = 1',
+    probeBlock(HASH, "probe('x')"),
+    `// dsh-debug:fix ${HASH} 修复`,
+    'const b = 2',
+    '',
+  ].join('\r\n')
+  const result = removeMarkers(source, HASH)
+  assert.equal(result.text, 'const a = 1\r\nconst b = 2\r\n')
+  assert.ok(!/[^\r]\n/.test(result.text), '除了 CRLF 之外不该出现裸 LF')
 })
 
 test('removeBlocks 顺带收敛摘除缝上的多余空行（实测连续五轮同一模式）', () => {
@@ -133,7 +246,7 @@ test('removeBlocks 顺带收敛摘除缝上的多余空行（实测连续五轮�
   assert.equal(tightResult.text, 'x = 1\ny = 2')
   assert.equal(tightResult.collapsedBlankLines, 0)
 
-  // `fix` 块是用户的修复：它周围的空白**一点都不许**被折叠。
+  // `fix` 标记是行级标记：removeBlocks 不动它。
   const withFix = ['a', '', `# dsh-debug:fix ${HASH} 修好了空数组分支`, 'b = 1', '', 'c'].join('\n')
   const fixResult = removeBlocks(withFix, 'deadbeef')
   assert.equal(fixResult.removed.length, 0)
@@ -266,7 +379,9 @@ test('pairBlocks 只在 start/end 的 kind、hash、缩进全一致时成交', (
   const { blocks, unresolved } = pairBlocks(findMarkers(text))
   assert.equal(blocks.length, 1)
   assert.equal(blocks[0].kind, 'probe')
-  assert.equal(unresolved.length, 2, 'kind 不匹配的那对必须报出来')
+  // `fix` 现在被识别为**行级**标记（没有 edge），不参与配对；temp 的 start 没配对。
+  assert.equal(unresolved.length, 1)
+  assert.match(unresolved[0].reason, /没有配对的 end/)
 })
 
 test('introducedIdentifiers 提取块里新引入的名字，并跳过桩自带的公开名', () => {
@@ -278,150 +393,6 @@ test('introducedIdentifiers 提取块里新引入的名字，并跳过桩自带�
   assert.ok(names.includes('makeProbe'), '自定义 helper 必须被抓到（那是最毒的残留形态）')
   assert.ok(names.includes('localHelper'))
   assert.ok(!names.includes('probe') && !names.includes('probeScope'))
-})
-
-test('findChangeMarkers 只认 change，不认 probe', () => {
-  const text = [
-    `// dsh-debug:probe ${HASH} start`,
-    `// dsh-debug:change ${HASH} 修复：空数组`,
-    'const a = 1',
-  ].join('\n')
-  const marks = findChangeMarkers(text)
-  assert.equal(marks.length, 1)
-  assert.equal(marks[0].hash, HASH)
-})
-
-test('diffIndex 报新增/修改/删除，且以内容哈希为准而不是 mtime', () => {
-  const before = { 'a.js': { size: 1, mtimeMs: 1, hash: 'h1' }, 'b.js': { size: 1, mtimeMs: 1, hash: 'h2' } }
-  const after = { 'a.js': { size: 1, mtimeMs: 2, hash: 'h1' }, 'c.js': { size: 1, mtimeMs: 3, hash: 'h3' } }
-  assert.deepEqual(diffIndex(before, after), { added: ['c.js'], changed: [], removed: ['b.js'] })
-})
-
-test('indexWorkspace 排除 .dsh/node_modules/.git，并返回截断标记而不是静默', async () => {
-  const workspace = await createWorkspace({
-    'src/app.js': 'export const a = 1\n',
-    '.dsh/debug-mode/tasks/x/state.json': '{}',
-    'node_modules/pkg/index.js': 'module.exports = 1\n',
-    '.git/config': '[core]\n',
-  })
-  try {
-    const index = await indexWorkspace(workspace.root)
-    assert.deepEqual(Object.keys(index.entries), ['src/app.js'])
-    assert.equal(index.truncated, false)
-    assert.equal(index.error, null)
-
-    const limited = await indexWorkspace(workspace.root, { maxFiles: 0 })
-    assert.equal(limited.truncated, true, '截断必须能被调用方看见（第 2 条）')
-    assert.match(String(limited.truncatedReason), /文件数预算/)
-  } finally {
-    await workspace.cleanup()
-  }
-})
-
-test('indexWorkspace：大文件进索引（hash 为 null）而不是被丢掉；stat 没变就不重算指纹', async () => {
-  // 注意扩展名必须在 `TEXT_EXTENSIONS` 里，否则它压根不是候选文件（那是另一条规则）。
-  const big = `${'  "k": 1,\n'.repeat(60_000)}` // 约 540 KiB，超过单文件扫描上限
-  const workspace = await createWorkspace({
-    'src/app.js': 'export const a = 1\n',
-    'data/big.json': `{\n${big}}\n`,
-  })
-  try {
-    const first = await indexWorkspace(workspace.root)
-    // [x] 老实现 `if (info.size > MAX) continue` 把大文件**从索引里删掉**，于是它永远
-    // 不会出现在 diff 里——"改了 5 MB 的 lockfile"这种改动根本检测不到。
-    assert.ok('data/big.json' in first.entries, '大文件必须进索引，只是不算指纹')
-    assert.equal(first.entries['data/big.json'].hash, null)
-    assert.ok(first.entries['src/app.js'].hash)
-
-    // 第二遍带上基线：内容哈希应当被复用（同一个值），且不重新读文件内容。
-    const second = await indexWorkspace(workspace.root, { previous: first.entries })
-    assert.equal(second.entries['src/app.js'].hash, first.entries['src/app.js'].hash)
-    assert.equal(second.entries['data/big.json'].hash, null)
-
-    // 只动 mtime 不改内容：指纹照样复用，diff 会判它没变。
-    const touched = await indexWorkspace(workspace.root, { previous: first.entries })
-    assert.equal(diffIndex(first.entries, touched).changed.length, 0)
-  } finally {
-    await workspace.cleanup()
-  }
-})
-
-test('diffIndex：没有内容指纹时按 stat 判改动（大文件也不再漏检）', () => {
-  const before = { 'a.json': { size: 10, mtimeMs: 1, hash: null } }
-  const after = { 'a.json': { size: 12, mtimeMs: 1, hash: null } }
-  assert.deepEqual(diffIndex(before, after).changed, ['a.json'])
-
-  const sameSize = { 'a.json': { size: 10, mtimeMs: 99, hash: null } }
-  assert.deepEqual(diffIndex(before, sameSize).changed, ['a.json'], 'mtime 变了也算改过')
-
-  const untouched = { 'a.json': { size: 10, mtimeMs: 1, hash: null } }
-  assert.deepEqual(diffIndex(before, untouched).changed, [])
-})
-
-test('walkSourceFiles：生成物目录被排除并记账，时间预算到顶也置 truncated', async () => {
-  const workspace = await createWorkspace({
-    'src/app.js': 'export const a = 1\n',
-    'dist/bundle.js': 'x\n',
-    'node_modules/pkg/index.js': 'x\n',
-    'coverage/lcov.info': 'x\n',
-  })
-  try {
-    const walked = await walkSourceFiles(workspace.root)
-    assert.deepEqual(walked.files.map((file) => file.split(/[\\/]/).pop()), ['app.js'])
-    assert.equal(walked.truncated, false)
-    assert.ok(walked.skippedDirs.some((dir) => dir.endsWith('dist')), '被跳过的目录要记账')
-
-    const noTime = await walkSourceFiles(workspace.root, { budgetMs: -1 })
-    assert.equal(noTime.truncated, true)
-    assert.match(String(noTime.truncatedReason), /时间预算/)
-  } finally {
-    await workspace.cleanup()
-  }
-})
-
-test('scanResidue：发现遍历被截断时 complete=false，但**报备过的文件照样被完整扫描**', async () => {
-  // 真实场景：几万个文件的仓库，探针埋在遍历预算之外。
-  // 老实现下这次收尾会返回"没有残留"——那是本插件最糟的一种失败（静默漏删）。
-  const workspace = await createWorkspace({
-    'src/owned.js': `const a = 1\n${probeBlock(HASH, "probe('owned')")}\nexport default a\n`,
-    // 大到超过发现路径的单文件上限：不报备就永远扫不到。
-    'data/huge.js': `${probeBlock(HASH, "probe('huge')")}\n${'// padding\n'.repeat(60_000)}`,
-    'dist/generated.js': `// dsh-debug:probe ${HASH} start\nprobe('built')\n// dsh-debug:probe ${HASH} end\n`,
-    'src/other.js': 'export const other = 1\n',
-  })
-  try {
-    // ① 没有报备：发现路径被预算卡死，超大文件被跳过，`dist/` 被排除。
-    const blind = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH], maxFiles: 1 })
-    assert.equal(blind.complete, false, '截断必须让 complete 为假（否则收尾会宣称干净）')
-    assert.match(String(blind.truncatedReason), /文件数预算/)
-    assert.ok(blind.skipped > 0 || blind.truncated)
-
-    // ② 报了 `data/huge.js`：它被完整扫描，且**不受**大小上限与预算约束。
-    const declared = await scanResidue(workspace.root, {
-      hash: HASH,
-      knownHashes: [HASH],
-      priority: ['data/huge.js'],
-      maxFiles: 1,
-    })
-    assert.deepEqual(declared.targetFiles, ['data/huge.js'],
-      '报备过的文件必须出现在残留清单里，哪怕它超大、哪怕遍历被截断')
-    assert.equal(declared.priorityScanned, 1)
-    assert.equal(declared.complete, false, '发现仍然不完整，这一点必须如实保留')
-
-    // ③ 报备了 dist/ 里的文件：跳过目录也不影响"声明优先"。
-    //    此时发现路径也把 src/owned.js 扫到了（默认预算足够），所以它一并出现——
-    //    这条断言只钉"报备的 dist 文件确实被读到"，不假设发现路径扫不到什么。
-    const fromDist = await scanResidue(workspace.root, {
-      hash: HASH,
-      knownHashes: [HASH],
-      priority: ['dist/generated.js'],
-      maxFiles: 1,
-    })
-    assert.ok(fromDist.targetFiles.includes('dist/generated.js'),
-      '被 skipDirs 排除的目录里的报备文件也必须被扫描')
-  } finally {
-    await workspace.cleanup()
-  }
 })
 
 test('scanPaths：声明过但读不到的文件进 unreadable（收尾不得据此宣称干净）', async () => {
@@ -436,34 +407,25 @@ test('scanPaths：声明过但读不到的文件进 unreadable（收尾不得据
   }
 })
 
-test('scanPaths 与 scanResidue 对同一文件给出逐字段一致的分类（口径只有一份）', async () => {
-  const source = [
-    'const a = 1',
-    probeBlock(HASH, "probe('x')"),
-    `// dsh-debug:fix ${HASH} 修复：保留我`,
-    'const b = 2',
-  ].join('\n')
-  const workspace = await createWorkspace({ 'src/app.js': source })
+test('scanDeclared 只扫给定清单：没报备、git 也没发现的文件一个都不看', async () => {
+  const workspace = await createWorkspace({
+    'src/own.js': `const a = 1\n${probeBlock(HASH, "probe('own')")}\nexport default a\n`,
+    'src/unreported.js': `const b = 1\n${probeBlock(HASH, "probe('unreported')")}\nexport default b\n`,
+  })
   try {
-    const viaPaths = await scanPaths(workspace.root, ['src/app.js'], { hash: HASH, knownHashes: [HASH] })
-    const viaWalk = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH] })
-    const pick = (entry) => ({
-      path: entry.path,
-      hasTargetBlocks: entry.hasTargetBlocks,
-      markers: entry.markers.map((marker) => [marker.line, marker.kind, marker.hash, marker.edge]),
-      blocks: entry.blocks,
-      unresolved: entry.unresolved,
-      changeMarkers: entry.changeMarkers,
-      foreignHashes: entry.foreignHashes,
-      stubRefs: entry.stubRefs,
-    })
-    assert.deepEqual(pick(viaPaths.affected[0]), pick(viaWalk.affected[0]))
+    const scan = await scanDeclared(workspace.root, ['src/own.js'], { hash: HASH, knownHashes: [HASH] })
+    assert.deepEqual(scan.targetFiles, ['src/own.js'])
+    assert.equal(scan.scanned, 1)
+    assert.equal(scan.complete, true)
+    assert.ok(!scan.affected.some((entry) => entry.path === 'src/unreported.js'),
+      '不在清单里的文件绝不进入扫描结果')
+    assert.deepEqual(scan.unreadable, [])
   } finally {
     await workspace.cleanup()
   }
 })
 
-test('scanResidue：宽松发现、严格分类、hash 不属于任何已知任务 ⇒ 进隔离区', async () => {
+test('scanDeclared：宽松发现、严格分类、hash 不属于任何已知任务 ⇒ 进隔离区', async () => {
   const workspace = await createWorkspace({
     'src/own.js': `const a = 1\n${probeBlock(HASH, "probe('own')")}\nexport default a\n`,
     'src/stub-ref.js': "import { probe } from './.dsh/debug-mode/tasks/" + HASH + "/runtime/probe.mjs'\n",
@@ -472,7 +434,11 @@ test('scanResidue：宽松发现、严格分类、hash 不属于任何已知任�
     'src/clean.js': 'export const clean = true\n',
   })
   try {
-    const scan = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH] })
+    const scan = await scanDeclared(
+      workspace.root,
+      ['src/own.js', 'src/stub-ref.js', 'src/foreign.js', 'src/broken.js', 'src/clean.js'],
+      { hash: HASH, knownHashes: [HASH] },
+    )
     assert.deepEqual(scan.targetFiles, ['src/own.js'])
     assert.deepEqual(scan.stubRefFiles, ['src/stub-ref.js'])
     assert.ok(scan.quarantine.some((entry) => entry.path === 'src/foreign.js' && entry.hash === OTHER),
@@ -480,25 +446,25 @@ test('scanResidue：宽松发现、严格分类、hash 不属于任何已知任�
     assert.ok(scan.quarantine.some((entry) => entry.path === 'src/broken.js'),
       '格式残缺也必须进隔离区（下划线写法是真实现场）')
     assert.ok(!scan.affected.some((entry) => entry.path === 'src/clean.js'), '完全无标记的文件不该进候选集')
+    assert.ok(scan.markerFiles.includes('src/own.js'))
   } finally {
     await workspace.cleanup()
   }
 })
 
-test('scanResidue：桩引用**两形态**都能被抓到（临时根与工作区回退根）', async () => {
-  // 为什么这条要单独钉住：产物现在默认落在**用户临时目录**里
-  // （`.../Temp/dsh-debug-mode/tasks/<hash>/runtime/probe.mjs`），而临时根不可写时
-  // 回退到工作区（`.dsh/debug-mode/tasks/<hash>/runtime/probe.mjs`）。
-  //
-  // 于是"业务代码里那句 import"有**两形态**，而两者的共同危险是一样的：桩会随任务目录
-  // 一起被删掉，调用还在的话代码直接编译不过。老正则只认带 `.dsh/` 的那一种，
-  // 临时根形态的引用会**扫得到、流程却不提示**——那正是"漏删的残留没有下游拦截"。
+test('scanDeclared：桩引用**两形态**都能被抓到（临时根与工作区回退根）', async () => {
+  // 产物默认落在**用户临时目录**里（`.../Temp/dsh-debug-mode/tasks/<hash>/runtime/probe.mjs`），
+  // 临时根不可写时回退到工作区（`.dsh/debug-mode/tasks/<hash>/runtime/probe.mjs`）。
+  // 两种引用形态的共同危险一样：桩会随任务目录删除，调用还在的话代码直接编译不过。
   const workspace = await createWorkspace({
     'src/temp-ref.js': `import { probe } from './dsh-debug-mode/tasks/${HASH}/runtime/probe.mjs'\n`,
     'src/legacy-ref.js': `// file:///${'C:/Users/x/AppData/Local/Temp'}/dsh-debug-mode/tasks/${HASH}/runtime/probe.mjs\n`,
   })
   try {
-    const scan = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH] })
+    const scan = await scanDeclared(workspace.root, ['src/temp-ref.js', 'src/legacy-ref.js'], {
+      hash: HASH,
+      knownHashes: [HASH],
+    })
     assert.deepEqual(scan.stubRefFiles.slice().sort(), ['src/legacy-ref.js', 'src/temp-ref.js'],
       '两形态都必须被列出来——只认 `.dsh/` 那一形态会让临时根形态静默漏掉')
   } finally {
@@ -506,16 +472,30 @@ test('scanResidue：桩引用**两形态**都能被抓到（临时根与工作�
   }
 })
 
-test('planCleanup + applyCleanup：先备份再写，且 fix 块原样保留', async () => {
+test('scanDeclared：收尾后本任务标记与垃圾注释都在 markerFiles 里（复扫据此判不干净）', async () => {
+  const workspace = await createWorkspace({
+    'src/app.js': `const a = 1\n// dsh-debug:tmp\n${probeBlock(HASH, "probe('x')")}\n`,
+  })
+  try {
+    const scan = await scanDeclared(workspace.root, ['src/app.js'], { hash: HASH, knownHashes: [HASH] })
+    assert.deepEqual(scan.markerFiles, ['src/app.js'])
+    assert.deepEqual(scan.targetFiles, ['src/app.js'])
+  } finally {
+    await workspace.cleanup()
+  }
+})
+
+test('planCleanup + applyCleanup：先备份再写，所有标记清掉、修复代码保留', async () => {
   const source = [
     'const a = 1',
     probeBlock(HASH, "probe('a')"),
     `// dsh-debug:fix ${HASH} 修复：保留我`,
     'const fixed = 2',
+    `// dsh-debug:change ${HASH} 备注`,
   ].join('\n')
   const workspace = await createWorkspace({ 'src/app.js': source })
   try {
-    const scan = await scanResidue(workspace.root, { hash: HASH, knownHashes: [HASH] })
+    const scan = await scanDeclared(workspace.root, ['src/app.js'], { hash: HASH, knownHashes: [HASH] })
     const plan = await planCleanup(workspace.root, scan, HASH)
     const result = await applyCleanup(workspace.root, plan.plans, {
       backupsDir: join(workspace.root, '.dsh', 'debug-mode', 'tasks', HASH, 'backups'),
@@ -526,9 +506,9 @@ test('planCleanup + applyCleanup：先备份再写，且 fix 块原样保留', a
     assert.deepEqual(result.failed, [])
 
     const after = await readFile(join(workspace.root, 'src', 'app.js'), 'utf8')
-    assert.ok(!after.includes('dsh-debug:probe'))
-    assert.ok(after.includes('dsh-debug:fix'), '用户的修复必须原样待在原地')
-    assert.ok(after.includes('const fixed = 2'))
+    assert.ok(!after.includes('dsh-debug'), '所有调试标记都必须清掉')
+    assert.ok(!after.includes("probe('a')"), '探针块必须摘掉')
+    assert.ok(after.includes('const fixed = 2'), '修复代码必须原样待在原地')
 
     // 备份必须存在（"绝不自动还原"，但要给用户查看 / diff 的入口）。
     const backup = await readFile(join(workspace.root, '.dsh', 'debug-mode', 'tasks', HASH, 'backups', 'src__app.js'), 'utf8')

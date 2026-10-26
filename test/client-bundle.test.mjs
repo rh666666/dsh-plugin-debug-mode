@@ -583,7 +583,7 @@ test('折叠：只有轮到用户时自动展开；头部可手动折叠/展开�
       json: async () => ({ task: { hash: 'deadbeef', round: 2, status: 'awaiting-agent', userVerdict: 'resolved' } }),
     })
     const resolved = await react.run(() => panel({ sessionId: 's1' }))
-    assert.match(collectText(resolved).join('\n'), /已通知 Agent 清理探针/)
+    assert.match(collectText(resolved).join('\n'), /已通知 Agent 清理调试标记/)
     assert.equal(collectActionButtons(resolved).length, 0, 'awaiting-agent 时不该再给按钮（防连点）')
 
     globalThis.fetch = async () => ({
@@ -643,14 +643,14 @@ test('按钮文案与宿主 `USER_SIGNAL_LABEL` 逐字一致（用户点按钮�
     `客户端必须有逐字相同的「${USER_SIGNAL_LABEL.reproduced}」`)
 })
 
-test('宿主说"残留检测未生效"时，面板必须把它显示出来（绝不假装保护着）', async () => {
+test('宿主写不进任务目录时，面板必须把它显示出来（绝不假装保护着）', async () => {
   const { exportsObject } = await loadExports()
   const { panel } = mountPanel(exportsObject)
   const task = {
     hash: 'deadbeef',
     round: 1,
     status: 'awaiting-user',
-    detector: { available: false, writeProbe: false, writeProbeError: 'EACCES', coverage: 'unavailable' },
+    detector: { available: false, writeProbe: false, writeProbeError: 'EACCES', changeSource: 'git' },
   }
 
   const originalFetch = globalThis.fetch
@@ -658,28 +658,27 @@ test('宿主说"残留检测未生效"时，面板必须把它显示出来（绝
   try {
     const tree = await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))
     const text = collectText(tree).join('\n')
-    assert.match(text, /残留检测未生效/)
+    assert.match(text, /收尾写入不可用/)
     assert.match(text, /EACCES/)
 
-    // 反例：检测可用时不该出现这条告警（否则用户会习惯性忽略它）。
+    // 反例：可写时不该出现这条告警（否则用户会习惯性忽略它）。
     globalThis.fetch = async () => ({
       ok: true,
-      json: async () => ({ task: { ...task, detector: { available: true, writeProbe: true, coverage: 'full' } } }),
+      json: async () => ({ task: { ...task, detector: { available: true, writeProbe: true, changeSource: 'git' } } }),
     })
     const healthy = await react.run(() => panel({
       sessionId: 's1',
       useInput: () => ({ draft: '' }),
     }))
-    assert.ok(!/残留检测未生效/.test(collectText(healthy).join('\n')))
+    assert.ok(!/收尾写入不可用/.test(collectText(healthy).join('\n')))
   } finally {
     globalThis.fetch = originalFetch
   }
 })
 
-test('大仓库（发现不完整）与"根本写不进去"必须分开说：partial 不等于 unavailable', async () => {
+test('没有 git 时面板必须说清清理范围：只按报备文件，不再假装全仓扫描', async () => {
   const { exportsObject } = await loadExports()
   const { panel } = mountPanel(exportsObject)
-  // 根是可写的，只是仓库太大：报备过的探针照样会被摘除，措辞不能说成"没在保护"。
   const task = {
     hash: 'deadbeef',
     round: 2,
@@ -687,9 +686,8 @@ test('大仓库（发现不完整）与"根本写不进去"必须分开说：par
     detector: {
       available: true,
       writeProbe: true,
-      coverage: 'partial',
-      truncated: true,
-      truncatedReason: '文件数预算 20000 到顶',
+      changeSource: 'ledger',
+      gitError: 'not-repo',
     },
   }
 
@@ -697,9 +695,17 @@ test('大仓库（发现不完整）与"根本写不进去"必须分开说：par
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ task }) })
   try {
     const text = collectText(await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))).join('\n')
-    assert.match(text, /只覆盖了一部分/)
-    assert.match(text, /已报备的探针仍会被完整摘除/)
-    assert.ok(!/残留检测未生效/.test(text), 'partial 不许复用 unavailable 的文案（那是两件事）')
+    assert.match(text, /未检测到 git/)
+    assert.match(text, /只清理你报备的文件/)
+    assert.ok(!/只覆盖了一部分/.test(text), '不再有"扫描被截断"那一档')
+
+    // 反例：git 可用时不该出现这条告警。
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ task: { ...task, detector: { ...task.detector, changeSource: 'git', gitError: null } } }),
+    })
+    const withGit = collectText(await react.run(() => panel({ sessionId: 's1', useInput: () => ({ draft: '' }) }))).join('\n')
+    assert.ok(!/未检测到 git/.test(withGit))
   } finally {
     globalThis.fetch = originalFetch
   }

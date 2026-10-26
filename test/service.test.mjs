@@ -17,13 +17,14 @@
  */
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 
 import { ARTIFACT_ROOT, DebugService } from '../lib/debug-service.js'
-import { scanResidue } from '../lib/scan.js'
+import { scanDeclared } from '../lib/scan.js'
 import { createHash } from '../lib/task.js'
 import {
   createArtifactBase,
@@ -40,7 +41,7 @@ const OTHER_SESSION = 'session-bbbb'
 /**
  * 起一个服务 + 临时工作区 + **自己的产物根父目录**。
  * @param {Record<string, string>} [files]
- * @param {{ tempDir?: string, webPort?: number, createHash?: () => string, scanMaxFiles?: number }} [options]
+ * @param {{ tempDir?: string, webPort?: number, createHash?: () => string }} [options]
  */
 async function setup(files = {}, options = {}) {
   const workspace = await createWorkspace({
@@ -54,7 +55,6 @@ async function setup(files = {}, options = {}) {
     logger: fake.ctx.logger,
     tempDir: options.tempDir ?? art.base,
     ...(options.createHash ? { createHash: options.createHash } : {}),
-    ...(options.scanMaxFiles !== undefined ? { scanMaxFiles: options.scanMaxFiles } : {}),
   })
   return { service, fake, workspace, art }
 }
@@ -66,6 +66,24 @@ async function startTask(service, workspace, sessionId = SESSION, goal = '点了
   assert.equal(started.ok, true, started.text)
   return started
 }
+
+/** 用 `stdio: 'ignore'` 跑 git：受限环境里默认管道会被拒，这里只关心退出码。 */
+function git(cwd, args) {
+  const result = spawnSync('git', ['-C', cwd, ...args], { stdio: 'ignore' })
+  assert.equal(result.status, 0, `git ${args.join(' ')} 失败（${result.error?.code ?? 'exit'}）`)
+}
+
+/** 把临时工作区变成一个有基线提交的 git 仓库。 */
+function initGit(root) {
+  git(root, ['init', '-q'])
+  git(root, ['config', 'user.email', 'test@example.com'])
+  git(root, ['config', 'user.name', 'test'])
+  git(root, ['add', '.'])
+  git(root, ['commit', '-qm', 'init'])
+}
+
+const HAS_GIT = spawnSync('git', ['--version'], { stdio: 'ignore' }).status === 0
+const GIT_SKIP = HAS_GIT ? false : '环境里没有 git'
 
 test('无票调用 dsh_debug_start 一律被拒（入口唯一的硬校验）', async () => {
   const { service, workspace, art } = await setup()
@@ -109,7 +127,7 @@ test('S1：签票后 start 建出哈希、目录、桩与指南，并消费票�
     assert.ok(!stub.includes('__DSH_TASK__'), '占位符必须被替换')
     assert.ok(await readIfExists(paths.guide) !== null)
     assert.ok(await readIfExists(join(dir, 'state.json')) !== null)
-    assert.ok(await readIfExists(join(dir, 'index.json')) !== null, 'R1 基线索引必须落盘')
+    assert.equal(await readIfExists(join(dir, 'index.json')), null, '不再建全仓索引')
 
     // 指南里的哈希与路径必须是真值（否则 Agent 会照着占位符埋点）。
     const guide = await readFile(paths.guide, 'utf8')
@@ -160,6 +178,7 @@ test('S2：报告只加探针 → awaiting-user；探针账与修复账分开记
       sessionId: SESSION,
       workspace: workspace.root,
       analysis: '怀疑 total 在空数组时返回 NaN',
+      probeFiles: ['src/app.js'],
       probes: [{ probe: 'src/app.js:1:items', why: '确认 items 真的是空数组' }],
     })
     assert.equal(reported.ok, true, reported.text)
@@ -184,20 +203,77 @@ test('R4 L1 闸门：第 1 轮出现 dsh-debug:change 被拒；连续 3 次后�
       changeMark(started.hash, 'export function total() { return items.length || 0 }'),
     ].join('\n'))
 
-    const first = await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '顺手改一下' })
+    const first = await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '顺手改一下',
+      changedFiles: ['src/app.js'],
+    })
     assert.equal(first.ok, false, '第 1 轮改代码必须被拒')
     assert.match(first.text, /第 1 轮是只读取证轮/)
     assert.equal(service.tasks.get(SESSION).status, 'active', '被拒时状态不得前进')
 
-    const second = await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '还是想改' })
+    const second = await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '还是想改',
+      changedFiles: ['src/app.js'],
+    })
     assert.equal(second.ok, false)
 
     // 连续第 3 次同一原因 ⇒ 按防死锁规则降级，绝不把会话卡死。
-    const third = await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第三次' })
+    const third = await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '第三次',
+      changedFiles: ['src/app.js'],
+    })
     assert.equal(third.ok, true, '连续拒绝 3 次后必须降级为 warn-only')
     assert.match(third.text, /降级/)
     assert.equal(service.debts.some((entry) => entry.key.startsWith('gate:round1-change')), true,
       '降级必须写进欠账（面板要能看见）')
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('git 改动就是清理范围：没报备但 git 看得到的探针也会被清掉', { skip: GIT_SKIP }, async () => {
+  const { service, workspace, art } = await setup({ 'src/app.js': 'export const a = 1\n' })
+  try {
+    initGit(workspace.root)
+    const started = await startTask(service, workspace)
+    await workspace.write('src/app.js', [
+      'const a = 1',
+      probeBlock(started.hash, "probe('app')"),
+      'export default a',
+    ].join('\n'))
+    await workspace.write('src/extra.js', [
+      probeBlock(started.hash, "probe('extra')"),
+      'export const extra = 1',
+    ].join('\n'))
+
+    // 故意两个文件都不报：有 git 时它们仍然会进扫描范围（这是"两者共存"的一半）。
+    const reported = await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '没报文件，靠 git 兜底',
+    })
+    assert.equal(reported.ok, true, reported.text)
+    const task = service.tasks.get(SESSION)
+    assert.equal(task.changeSource, 'git')
+    assert.deepEqual(task.probeFiles, ['src/app.js', 'src/extra.js'])
+    assert.deepEqual(task.strayArtifacts, ['src/extra.js'])
+
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+    const ended = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(ended.ok, true, ended.text)
+    assert.equal(ended.scanIncomplete, false)
+    assert.deepEqual(ended.cleanedFiles.slice().sort(), ['src/app.js', 'src/extra.js'])
+    for (const file of ['src/app.js', 'src/extra.js']) {
+      const after = await readFile(join(workspace.root, ...file.split('/')), 'utf8')
+      assert.ok(!after.includes('dsh-debug'), `${file} 必须无痕`)
+    }
   } finally {
     await workspace.cleanup()
     await art.cleanup()
@@ -408,7 +484,12 @@ test('S5/S7：未经用户表态 end 被拒；resolve 幂等只唤醒一次；en
     ].join('\n'))
     const withFix = await readFile(sourcePath, 'utf8')
 
-    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '空数组分支' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '空数组分支',
+      probeFiles: ['src/app.js'],
+    })
 
     // 用户还没表态：Agent 不得自作主张收尾。
     const premature = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '我先关了' })
@@ -445,10 +526,9 @@ test('S5/S7：未经用户表态 end 被拒；resolve 幂等只唤醒一次；en
     assert.equal(ended.scanIncomplete, false, '干净收尾不该带 incomplete 标记')
 
     const after = await readFile(sourcePath, 'utf8')
-    assert.ok(!after.includes('dsh-debug:probe'), '探针块必须摘干净')
-    assert.ok(after.includes('dsh-debug:fix'), '修复标记必须保留')
-    assert.ok(after.includes('items.length === 0 ? 0 : items.length'), '修复本身必须原样保留')
-    assert.notEqual(after, withFix, '至少探针那几行应该没了')
+    assert.ok(!after.includes('dsh-debug'), '所有调试标记都必须清干净')
+    assert.ok(after.includes('items.length === 0 ? 0 : items.length'), '修复代码必须原样保留')
+    assert.notEqual(after, withFix, '至少探针块与 fix 标记那几行应该没了')
     assert.ok(ended.keptFiles.includes('src/app.js'))
 
     // 任务目录随任务一起消失。目录位置取自 `pathsOf(task)`：产物根是运行时解析的，
@@ -517,7 +597,12 @@ test('隔离区：hash 不属于任何已知任务时，end 暂停并要求用�
   try {
     const started = await startTask(service, workspace)
     await workspace.write('src/app.js', `${probeBlock(started.hash, "probe('x')")}\nexport const a = 1\n`)
-    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '看看' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '看看',
+      probeFiles: ['src/app.js', 'src/foreign.js'],
+    })
     await service.resolve({ hash: started.hash, sessionId: SESSION })
 
     const paused = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
@@ -538,6 +623,95 @@ test('隔离区：hash 不属于任何已知任务时，end 暂停并要求用�
     // `mine` = 用户自己处理 ⇒ 宿主不碰那一行。
     const foreign = await readFile(join(workspace.root, 'src', 'foreign.js'), 'utf8')
     assert.match(foreign, /dsh-debug:probe 0011aabb start/)
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('隔离区：delete 会把别的任务的块整块摘掉，而不是只删 start 行', async () => {
+  const FOREIGN_HASH = 'cafebabe'
+  const { service, workspace, art } = await setup({
+    'src/foreign.js': [
+      `// dsh-debug:probe ${FOREIGN_HASH} start`,
+      "probe('foreign')",
+      `// dsh-debug:probe ${FOREIGN_HASH} end`,
+      'const keep = 1',
+    ].join('\n'),
+  })
+  try {
+    const started = await startTask(service, workspace)
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '看看外来标记',
+      probeFiles: ['src/foreign.js'],
+    })
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+
+    const paused = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(paused.needsDecision, true)
+    assert.match(paused.text, /src\/foreign\.js:1/, '隔离区条目必须能定位到块首行')
+
+    const finished = await service.end({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      summary: '收工',
+      quarantine: [{ path: 'src/foreign.js', decision: 'delete' }],
+    })
+    assert.equal(finished.ok, true, finished.text)
+    const after = await readFile(join(workspace.root, 'src', 'foreign.js'), 'utf8')
+    assert.ok(!after.includes('dsh-debug'), '整块都要摘掉，不能只删 start 行')
+    assert.ok(!after.includes("probe('foreign')"), '块体也要删掉')
+    assert.ok(after.includes('const keep = 1'), '块外代码必须保留')
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
+test('隔离区 delete 与普通清理落在同一文件时串行执行，不会把已删的块写回来', async () => {
+  const FOREIGN_HASH = 'cafebabe'
+  const { service, workspace, art } = await setup({
+    'src/mixed.js': [
+      `// dsh-debug:probe ${FOREIGN_HASH} start`,
+      "probe('foreign')",
+      `// dsh-debug:probe ${FOREIGN_HASH} end`,
+      'const keep = 1',
+    ].join('\n'),
+  })
+  try {
+    const started = await startTask(service, workspace)
+    // 本任务的探针块在**外来块之前**：先被 planCleanup 删掉，行号会整体前移。
+    await workspace.write('src/mixed.js', [
+      probeBlock(started.hash, "probe('mine')"),
+      `// dsh-debug:probe ${FOREIGN_HASH} start`,
+      "probe('foreign')",
+      `// dsh-debug:probe ${FOREIGN_HASH} end`,
+      'const keep = 1',
+    ].join('\n'))
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '两个任务的块',
+      probeFiles: ['src/mixed.js'],
+    })
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+
+    const paused = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(paused.needsDecision, true)
+
+    const finished = await service.end({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      summary: '收工',
+      quarantine: [{ path: 'src/mixed.js', decision: 'delete' }],
+    })
+    assert.equal(finished.ok, true, finished.text)
+    const after = await readFile(join(workspace.root, 'src', 'mixed.js'), 'utf8')
+    assert.ok(!after.includes('dsh-debug'), '两个任务的块都必须清掉，且不能互相写回')
+    assert.ok(!after.includes("probe('mine')") && !after.includes("probe('foreign')"))
+    assert.ok(after.includes('const keep = 1'))
   } finally {
     await workspace.cleanup()
     await art.cleanup()
@@ -835,7 +1009,12 @@ test('收尾时会备份被改写的文件（绝不自动还原，但要留可�
   try {
     const started = await startTask(service, workspace)
     await workspace.write('src/app.js', `${probeBlock(started.hash, "probe('x')")}\nexport const a = 1\n`)
-    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: 'ok' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: 'ok',
+      probeFiles: ['src/app.js'],
+    })
     await service.resolve({ hash: started.hash, sessionId: SESSION })
     await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
 
@@ -973,12 +1152,22 @@ test('产物根 ⑤：走完整条流程，工作区里一个产物都不留（�
       'export function total() { return items.length }',
     ].join('\n'))
 
-    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '空数组分支' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '空数组分支',
+      probeFiles: ['src/app.js'],
+    })
     await service.resolve({ hash: started.hash, sessionId: SESSION })
     await service.continueDebug({ sessionId: SESSION, workspace: workspace.root, nextPlan: '换个假设' })
     await service.read({ sessionId: SESSION, workspace: workspace.root })
     // 再交卷一次，回到 awaiting-user，用户才能表态"已解决"（end 的前置）。
-    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: '第二轮' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '第二轮',
+      probeFiles: ['src/app.js'],
+    })
     await service.resolve({ hash: started.hash, sessionId: SESSION })
     const ended = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工', verified: true })
     assert.equal(ended.ok, true, ended.text)
@@ -1062,22 +1251,24 @@ test('产物根 ⑦：哈希目录已存在就换一个（临时根是全局共�
   }
 })
 
-test('大仓库收尾：报备的探针照样被摘除，但发现不完整时**不宣称干净、也不删证据**', async () => {
-  // 这条测试守的是本插件最糟的一种失败：遍历被预算截断 ⇒ 复扫"没发现残留" ⇒
-  // 返回 residualFiles: [] ⇒ 模型据此告诉用户"已清理干净"。实际探针还在代码里。
-  //
-  // 场景：探针埋在遍历预算之外（maxFiles=1），而且是被报备过的。
+test('没有 git 时只清账本：未报备的残留不会被碰，也不会假装全仓干净', async () => {
+  // 这条测试守的是新边界：不做全仓扫描 ⇒ 不在账本里的文件本来就不该被清，
+  // 但界面与返回值必须**说清范围**，不能让模型据此告诉用户"整个仓库干净了"。
   const { service, workspace, art } = await setup({
     'src/owned.js': 'export const a = 1\n',
-    // 一个真实的大文件，确保发现路径会跳过它（>512 KiB）。
-    'data/bulk.js': `${'// padding\n'.repeat(60_000)}\nexport const bulk = 1\n`,
-  }, { scanMaxFiles: 1 })
+    'src/unreported.js': 'export const b = 1\n',
+  })
   try {
     const started = await startTask(service, workspace)
     await workspace.write('src/owned.js', [
       'const items = []',
       probeBlock(started.hash, "probe('src/owned.js:1:items')"),
       'export function total() { return items.length }',
+    ].join('\n'))
+    await workspace.write('src/unreported.js', [
+      'const other = 1',
+      probeBlock(started.hash, "probe('src/unreported.js:1:other')"),
+      'export const b = other',
     ].join('\n'))
 
     const reported = await service.report({
@@ -1088,16 +1279,16 @@ test('大仓库收尾：报备的探针照样被摘除，但发现不完整时**
       headline: '看看 items',
     })
     assert.equal(reported.ok, true, reported.text)
-    assert.equal(reported.scanIncomplete, true, '遍历被截断时必须如实标记')
-    assert.match(reported.text, /已被逐个完整扫描/, '必须说清"报备的文件不受影响"')
+    assert.equal(reported.scanIncomplete, false, '清单里的文件都读到了，就没有覆盖不足')
+    assert.match(reported.text, /不是 git 仓库/, '没有 git 时必须说清清理范围')
 
     const task = service.tasks.get(SESSION)
-    assert.equal(task.scanCoverage.complete, false)
-    assert.equal(task.scanCoverage.priorityCount, 1)
-
-    // 面板三态：partial，不是 unavailable（根是可写的）。
+    assert.equal(task.scanCoverage.source, 'ledger')
+    assert.equal(task.scanCoverage.complete, true)
+    // 面板不再有"只覆盖一部分"那一档：范围由账本决定，不是扫描被截断。
     const state = await service.panelState(SESSION)
-    assert.equal(state.task.detector.coverage, 'partial')
+    assert.equal(state.task.detector.changeSource, 'ledger')
+    assert.equal(state.task.detector.coverage, undefined)
 
     await service.resolve({ hash: started.hash, sessionId: SESSION })
     const ended = await service.end({
@@ -1107,33 +1298,19 @@ test('大仓库收尾：报备的探针照样被摘除，但发现不完整时**
       cleanedFiles: ['src/owned.js'],
     })
 
-    // ① 摘除本身是**成功**的：报备过 ⇒ 不受预算影响。
+    // ① 报备过的探针被摘掉；未报备的同任务探针**不在范围内**，宿主不碰。
     assert.ok(ended.cleanedFiles.includes('src/owned.js'))
-    const after = await readFile(join(workspace.root, 'src', 'owned.js'), 'utf8')
-    assert.ok(!after.includes('dsh-debug:probe'), '报备的探针必须被摘掉')
+    const owned = await readFile(join(workspace.root, 'src', 'owned.js'), 'utf8')
+    assert.ok(!owned.includes('dsh-debug'))
+    const unreported = await readFile(join(workspace.root, 'src', 'unreported.js'), 'utf8')
+    assert.ok(unreported.includes('dsh-debug:probe'), '没报备的文件不在本次清理范围')
 
-    // ② 但结论不许干净：发现不完整 ⇒ scanIncomplete。
-    assert.equal(ended.scanIncomplete, true)
-    assert.deepEqual(ended.residualFiles, [], '残留清单本身是空的——这正是危险之处')
-
-    // ③ 首段即失败摘要（模型与用户都只读得到前面几行）。
-    const firstLine = ended.text.split('\n')[0]
-    assert.match(firstLine, /没有清干净/)
-    assert.ok(!/^调试任务 #\w+ 已结束/.test(ended.text), '不许用"已结束"打头')
-
-    // ④ 证据必须留下：日志、备份、账本都还在。
-    const dir = service.pathsOf(started).dir
-    assert.ok((await stat(join(dir, 'state.json'))).isFile(), '未清干净时必须保留任务目录')
-    assert.ok((await stat(join(dir, 'backups', 'src__owned.js'))).isFile(), '备份必须留下')
-    const residualFile = JSON.parse(await readFile(join(dir, 'residual.json'), 'utf8'))
-    assert.deepEqual(residualFile.reasons.residual, [])
-    assert.equal(residualFile.coverage.complete, false)
-
-    // ⑤ 已关闭但未清干净的任务要出现在欠账看板上（否则它永远躺在磁盘上没人看见）。
-    const board = await service.debtBoard()
-    assert.equal(board.unclean.length, 1)
-    assert.equal(board.unclean[0].hash, started.hash)
-    assert.match(await service.debtNotice('session-other'), /已关闭但收尾没清干净/)
+    // ② 结论按"账本范围"是干净的，但正文必须点明没有看全仓。
+    assert.equal(ended.scanIncomplete, false)
+    assert.deepEqual(ended.residualFiles, [])
+    assert.match(ended.text, /没有 git/)
+    assert.match(ended.text, /只核对了账本/)
+    assert.match(ended.text.split('\n')[0], /已结束/)
   } finally {
     await workspace.cleanup()
     await art.cleanup()
@@ -1164,12 +1341,41 @@ test('大仓库收尾：报备过但读不到的文件同样挡住"干净"结论
   }
 })
 
+test('收尾后仍引用探针桩路径 ⇒ 不宣称干净、保留证据', async () => {
+  const { service, workspace, art } = await setup()
+  try {
+    const started = await startTask(service, workspace)
+    await workspace.write('src/ref.js', `import { probe } from './dsh-debug-mode/tasks/${started.hash}/runtime/probe.mjs'\nprobe('x')\n`)
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: '桩引用残留',
+      probeFiles: ['src/ref.js'],
+    })
+    await service.resolve({ hash: started.hash, sessionId: SESSION })
+
+    const ended = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
+    assert.equal(ended.ok, true)
+    assert.equal(ended.scanIncomplete, true, '桩已随任务目录删除，引用还在 = 代码会编译不过')
+    assert.match(ended.text, /仍有文件引用探针桩路径/)
+    assert.ok((await stat(service.pathsOf(started).dir)).isDirectory(), '不干净时证据必须保留')
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
 test('收尾干净时任务目录照旧消失（默认路径不许被新逻辑带歪）', async () => {
   const { service, workspace, art } = await setup()
   try {
     const started = await startTask(service, workspace)
     await workspace.write('src/app.js', `${probeBlock(started.hash, "probe('x')")}\nexport const a = 1\n`)
-    await service.report({ sessionId: SESSION, workspace: workspace.root, analysis: 'x' })
+    await service.report({
+      sessionId: SESSION,
+      workspace: workspace.root,
+      analysis: 'x',
+      probeFiles: ['src/app.js'],
+    })
     await service.resolve({ hash: started.hash, sessionId: SESSION })
     const ended = await service.end({ sessionId: SESSION, workspace: workspace.root, summary: '收工' })
 
@@ -1212,7 +1418,7 @@ test('收尾未干净的哈希不再被判成"陌生哈希"（否则同一批残
     assert.ok(known.includes(first.hash), '磁盘上的任务目录名必须算作已知哈希')
 
     // 旧标记对当前任务来说是"别的任务"，所以不该被自动删——但它也不该被当成陌生残留。
-    const scan = await scanResidue(workspace.root, { hash: second.hash, knownHashes: known })
+    const scan = await scanDeclared(workspace.root, ['src/left.js'], { hash: second.hash, knownHashes: known })
     assert.ok(!scan.quarantine.some((entry) => entry.path === 'src/left.js'),
       '已知任务的旧标记不许进隔离区（那会让用户反复回答同一个问题）')
   } finally {
