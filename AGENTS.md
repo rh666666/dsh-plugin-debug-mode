@@ -63,8 +63,11 @@ node scripts/probe-selfcheck.mjs   # 探针边界自检（退出码可进 CI；-
 
 ## 6 项目工程维护
 
-项目工程维护由用户手动进行，严格禁止 Agent 自主操作以下内容：
+项目工程维护由用户手动进行，严格禁止 Agent 修改项目中的以下文件：
 
-- 修改本文档
-- 修改 package.json
-- 发布 npm
+- AGENTS.md
+- CHANGELOG.md
+- LICENSE
+- package.json
+
+此外，项目的构建发布必须由人工完成，禁止 Agent 代为操作。
