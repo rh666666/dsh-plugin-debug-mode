@@ -471,6 +471,29 @@ test('S3：continue 清空日志但保留哈希；S4：read 真的读到探针�
   }
 })
 
+test('S4：单条内容显示被省略时，正文给出日志路径并建议直接读文件', async () => {
+  const { service, workspace, art } = await setup()
+  try {
+    const started = await startTask(service, workspace)
+    const { probe } = await import(pathToFileURL(started.probeStub).href)
+    const payload = 'x'.repeat(1000)
+    probe('src/app.js:1:big', { payload })
+
+    const read = await service.read({ sessionId: SESSION, workspace: workspace.root })
+    assert.equal(read.ok, true)
+    assert.equal(read.logPath, started.logPath, '返回值必须带上日志路径')
+    assert.ok(read.text.includes(started.logPath), '正文也要给出路径，否则模型不知道去哪读')
+    assert.match(read.text, /显示\*\*被缩短|显示省略/)
+    assert.match(read.text, /直接读日志文件/)
+
+    // 建议必须是真的：文件里确实留着被显示层省略的那段原文。
+    assert.ok((await readFile(started.logPath, 'utf8')).includes(payload), '日志文件里必须是完整值')
+  } finally {
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
 test('S5/S7：未经用户表态 end 被拒；resolve 幂等只唤醒一次；end 只撤探针、绝不回滚修复', async () => {
   const { service, fake, workspace, art } = await setup()
   try {

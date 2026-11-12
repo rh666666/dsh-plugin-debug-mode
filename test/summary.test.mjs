@@ -46,6 +46,54 @@ test('两种"看不见完整值"必须长得不一样：[!]截断（真的被省
   assert.match(completeLine, /显示省略/, '完整记录要说明是显示层缩短')
 })
 
+test('显示省略时给出日志路径与直接读文件的建议；写入层截断说明不可恢复', () => {
+  const big = 'x'.repeat(1000)
+  const logPath = '/tmp/dsh-debug-mode/tasks/deadbeef/deadbeef.log'
+  const text = renderLogSummary({
+    hash: 'deadbeef',
+    round: 1,
+    exists: true,
+    logPath,
+    text: [
+      // 完整记录：只是显示层缩短，日志文件里有全文。
+      JSON.stringify({ ts: '2026-10-10T10:00:00.000+08:00', task: 'deadbeef', probe: 'a:1', level: 'info', data: { v: big } }),
+      // 写入时已降级：文件里也没有全文，不能再让模型去翻。
+      JSON.stringify({ ts: '2026-10-10T10:00:01.000+08:00', task: 'deadbeef', probe: 'b:2', level: 'info', data: { v: big }, truncated: true }),
+    ].join('\n'),
+  })
+  assert.ok(text.includes(logPath), '显示省略时必须给出日志文件路径')
+  assert.match(text, /1 条内容只是\*\*显示\*\*被缩短/)
+  assert.match(text, /read.*offset\/limit|grep/)
+  assert.match(text, /日志文件里也没有完整值/, '写入层截断必须明说不可恢复')
+})
+
+test('没有被省略的内容不附加读文件建议', () => {
+  const logPath = '/tmp/dsh-debug-mode/tasks/deadbeef/deadbeef.log'
+  const text = renderLogSummary({
+    hash: 'deadbeef',
+    round: 1,
+    exists: true,
+    logPath,
+    text: logText([{ probe: 'a:1', level: 'info', data: { v: 'short' } }]),
+  })
+  assert.ok(!text.includes(logPath), '没截断时不该出现日志路径与劝告')
+  assert.ok(!text.includes('直接读日志文件'))
+})
+
+test('读取被截断（只读到尾部）时也给出日志路径', () => {
+  const logPath = '/tmp/dsh-debug-mode/tasks/deadbeef/deadbeef.log'
+  const text = renderLogSummary({
+    hash: 'deadbeef',
+    round: 1,
+    exists: true,
+    truncated: true,
+    logPath,
+    text: logText([{ probe: 'a:1', level: 'info' }]),
+  })
+  assert.ok(text.includes(logPath))
+  assert.match(text, /只读了日志尾部/)
+})
+
 test('日志文件不存在时给排查建议，而不是空表', () => {
   const text = renderLogSummary({ hash: 'deadbeef', round: 1, exists: false })
   assert.match(text, /日志文件不存在/)

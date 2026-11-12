@@ -513,7 +513,8 @@ test('apply 装配：一个命令 + 六条路由；每个 agent 拿到 5 个工�
     // 实测事故就是它反问「摄入路径是什么」。
     assert.match(withTask, /本任务的地址/, '地址块必须在注入段里')
     const paths = service.pathsOf(service.tasks.get(SESSION))
-    assert.ok(withTask.includes(paths.log), '日志路径也要在（但明说不要直接读）')
+    assert.ok(withTask.includes(paths.log), '日志路径必须每轮都在')
+    assert.match(withTask, /显示被省略|直接读这个文件/, '日志路径旁边要说明可以直接读文件')
     assert.ok(withTask.includes(paths.stub), '文件桩路径也要在')
     const endpoint = service.probeEndpoint(started.hash)
     if (endpoint) {
