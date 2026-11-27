@@ -260,7 +260,7 @@ test('apply(ctx) 用声明感知的 inject 注册到输入框**上方**的座位
   assert.equal(typeof options.label, 'function', 'label 用 thunk，切语言时无需重注册')
 })
 
-test('状态 tag：挂在零占用者的 list 座位上，是一个带叉的 chip（叉 = 「问题已解决」）', async () => {
+test('状态 tag：挂在零占用者的 list 座位上，静止显示 bug、悬停换成叉（叉 = 「问题已解决」）', async () => {
   const { exportsObject } = await loadExports()
   const { injections, chip, chipOptions } = mountPanel(exportsObject)
 
@@ -292,7 +292,16 @@ test('状态 tag：挂在零占用者的 list 座位上，是一个带叉的 chi
     assert.ok(tree, '有活跃任务时必须渲染 tag')
     assert.equal(tree.type, 'button', 'chip 是 button：那个叉要能点')
     assert.equal(collectText(tree).join(''), '调试', 'tag 上的文字就是「调试」')
-    assert.equal(collectByType(tree, 'svg').length, 1, '关闭图标用内联 SVG，不用字符图标')
+    const icons = collectByType(tree, 'svg')
+    assert.equal(icons.length, 2, '图标槽里是 bug 与叉两个内联图标，靠 CSS 切换，不用字符图标')
+    assert.ok(String(icons[0].props.className).includes('dsh-dbg-rest-glyph'), '静止时显示 bug 图标')
+    assert.ok(String(icons[1].props.className).includes('dsh-dbg-hover-glyph'), '悬停时换成叉图标')
+    // 切换规则必须真的在样式里：壳层只在悬停/聚焦时换图标，静止态两个都显示就等于看不出意图。
+    const cssSource = await readFile(SRC, 'utf8')
+    assert.match(cssSource, /\.dsh-dbg-chip:hover:not\(:disabled\) \.dsh-dbg-hover-glyph\{display:block\}/,
+      '悬停时叉要真的出现')
+    assert.match(cssSource, /\.dsh-dbg-chip:focus-visible \.dsh-dbg-hover-glyph\{display:block\}/,
+      '键盘聚焦时同样换成叉（照 plan 模式的做法）')
     assert.ok(String(tree.props['aria-label'] ?? '').length > 0,
       '按钮必须有无障碍名字：眼睛看到的是叉，屏幕阅读器要听到动作')
     assert.equal(tree.props['data-debug-status'], 'active', '状态放在 data 属性上，供面板/排查识别')

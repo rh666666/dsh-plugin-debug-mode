@@ -27,6 +27,7 @@
       "default": "./lib/probe.mjs"
     },
     "./cordis.patch.yml": "./cordis.patch.yml",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
@@ -35,6 +36,7 @@
     "scripts",
     "assets",
     "cordis.patch.yml",
+    "icon.svg",
     "AGENTS.md",
     "CHANGELOG.md",
     "README.md"
