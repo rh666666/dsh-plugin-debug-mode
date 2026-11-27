@@ -302,6 +302,13 @@ test('状态 tag：挂在零占用者的 list 座位上，静止显示 bug、悬
       '悬停时叉要真的出现')
     assert.match(cssSource, /\.dsh-dbg-chip:focus-visible \.dsh-dbg-hover-glyph\{display:block\}/,
       '键盘聚焦时同样换成叉（照 plan 模式的做法）')
+    // 静止态只显示 bug：隐藏叉的规则必须和图标槽里的显示规则同权重。
+    // 曾经写成宽泛的 `.dsh-dbg-glyph .dsh-dbg-svg{display:block}`，它盖掉了叉的默认隐藏，
+    // 于是静止时两个图标叠在一起。
+    assert.ok(!cssSource.includes('.dsh-dbg-glyph .dsh-dbg-svg{display:block}'),
+      '宽泛的 svg 显示规则会盖掉叉的隐藏规则，静止时两个图标会叠在一起')
+    assert.match(cssSource, /\.dsh-dbg-glyph \.dsh-dbg-hover-glyph\{display:none\}/,
+      '默认隐藏叉的规则必须带图标槽前缀，与显示规则同权重')
     assert.ok(String(tree.props['aria-label'] ?? '').length > 0,
       '按钮必须有无障碍名字：眼睛看到的是叉，屏幕阅读器要听到动作')
     assert.equal(tree.props['data-debug-status'], 'active', '状态放在 data 属性上，供面板/排查识别')
