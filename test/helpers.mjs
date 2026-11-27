@@ -166,12 +166,13 @@ export async function readIfExists(absolute) {
   }
 }
 
-/** 拼一个探针块（测试用）。 */
-export function probeBlock(hash, body, indent = '') {
+/** 拼一个探针块（测试用）。传 uid 时 start/end 行都带 `uid=<值>`。 */
+export function probeBlock(hash, body, indent = '', uid = null) {
+  const suffix = uid ? ` uid=${uid}` : ''
   return [
-    `${indent}// dsh-debug:probe ${hash} start`,
+    `${indent}// dsh-debug:probe ${hash}${suffix} start`,
     `${indent}${body}`,
-    `${indent}// dsh-debug:probe ${hash} end`,
+    `${indent}// dsh-debug:probe ${hash}${suffix} end`,
   ].join('\n')
 }
 

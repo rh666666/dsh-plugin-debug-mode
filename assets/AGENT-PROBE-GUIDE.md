@@ -191,18 +191,18 @@ Node 文件桩：`{{PROBE_STUB}}`，import 写法 `{{PROBE_IMPORT}}`
 dev server 根本看不见它）：
 
 ```html
-<!-- dsh-debug:probe {{HASH}} start -->
+<!-- dsh-debug:probe {{HASH}} uid=b1 start -->
 <script src="{{BROWSER_STUB_URL}}"></script>
-<!-- dsh-debug:probe {{HASH}} end -->
+<!-- dsh-debug:probe {{HASH}} uid=b1 end -->
 ```
 
-然后在可疑位置调用全局函数 `dshProbe`（同样夹在探针块里）：
+然后在可疑位置调用全局函数 `dshProbe`（同样夹在探针块里，块编号递增：下一个用 `uid=b2`）：
 
 ```html
 <script>
-// dsh-debug:probe {{HASH}} start
+// dsh-debug:probe {{HASH}} uid=b2 start
 dshProbe('buggy-demo.html:42:onclick', { itm: typeof itm, list: todos.length })
-// dsh-debug:probe {{HASH}} end
+// dsh-debug:probe {{HASH}} uid=b2 end
 </script>
 ```
 
@@ -236,14 +236,18 @@ dshProbe('buggy-demo.html:42:onclick', { itm: typeof itm, list: todos.length })
 
 | 标记 | 含义 | 收尾动作 |
 | --- | --- | --- |
-| `dsh-debug:probe {{HASH}} start/end` | 探针 | **整块删除** |
-| `dsh-debug:temp {{HASH}} start/end`（`tmp` 也认） | 临时探索（例如一段临时代码、一个 dump） | **整块删除** |
+| `dsh-debug:probe {{HASH}} uid=b<n> start/end` | 探针 | **整块删除** |
+| `dsh-debug:temp {{HASH}} uid=b<n> start/end`（`tmp` 也认） | 临时探索（例如一段临时代码、一个 dump） | **整块删除** |
 | `dsh-debug:fix {{HASH}} 说明` | 修复 | **只删标记注释，代码保留** |
 | `dsh-debug:change {{HASH}} 说明` | 行为改动（修复的备注） | **只删标记注释，代码保留** |
 
-`fix` 与 `change` 是**单行**标记，不需要 `start/end`；`probe` 与 `temp` 必须成对，
-且**成对的两个标记缩进必须一致**、中间不许夹别的标记行——不满足这三条的区间宿主
-**不会自动删**，而是丢进"隔离区"请用户逐条决定（宁可脏关闭，不可自动删用户代码）。
+`probe` 与 `temp` 块**必须写 `uid=b<n>`**（`n` 是正整数，如 `b1`、`b2`），同一任务内编号唯一。
+宿主按 uid 精确配对 start/end：缩进不一致、块内嵌套别的标记都不再算歧义。漏写 uid 会回退旧的
+栈式配对（要求缩进一致、块内无别的标记），**不推荐**，可能进隔离区；写错格式的 uid（如 `uid=xyz`）
+按无 uid 处理。
+
+`fix` 与 `change` 是**单行**标记，不需要 `start/end`，也不写 uid；`probe` 与 `temp` 必须成对。
+不满足配对的区间宿主**不会自动删**，而是丢进"隔离区"请用户逐条决定（宁可脏关闭，不可自动删用户代码）。
 收尾对**所有**标记一视同仁：调试模式结束后，代码里不应再留下任何 `dsh-debug:` 记号。
 
 ### 7.2 插块时**不要动原有的空行**（实测两个方向都踩过坑）

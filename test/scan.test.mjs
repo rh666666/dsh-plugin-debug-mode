@@ -155,6 +155,18 @@ test('tmp 别名与下划线分隔也能识别成 temp 块（Agent 常写错的�
   assert.equal(removeMarkers(source, HASH).text, 'const keep = 2')
 })
 
+test('findMarkers 解析 uid：大小写归一、去前导零，写错格式按无 uid 处理', () => {
+  const source = [
+    `// dsh-debug:probe ${HASH} uid=B02 start`,
+    'probe(1)',
+    `// dsh-debug:probe ${HASH} uid=b02 end`,
+    `// dsh-debug:probe ${HASH} uid=xyz start`,
+  ].join('\n')
+  const markers = findMarkers(source)
+  assert.deepEqual(markers.map((marker) => marker.uid), ['b2', 'b2', null])
+  assert.equal(markers[0].text, `// dsh-debug:probe ${HASH} uid=B02 start`, '原文不改写')
+})
+
 test('removeMarkers 保留原文件的 CRLF 换行，不把整份文件改成 LF', () => {
   const source = [
     'const a = 1',
@@ -382,6 +394,112 @@ test('pairBlocks 只在 start/end 的 kind、hash、缩进全一致时成交', (
   // `fix` 现在被识别为**行级**标记（没有 edge），不参与配对；temp 的 start 没配对。
   assert.equal(unresolved.length, 1)
   assert.match(unresolved[0].reason, /没有配对的 end/)
+})
+
+test('pairBlocks 带 uid 的嵌套、缩进不一致、多块交错都精确配对', () => {
+  const nested = [
+    `// dsh-debug:probe ${HASH} uid=b1 start`,
+    `// dsh-debug:probe ${HASH} uid=b2 start`,
+    `// dsh-debug:probe ${HASH} uid=b2 end`,
+    `// dsh-debug:probe ${HASH} uid=b1 end`,
+  ].join('\n')
+  const outer = pairBlocks(findMarkers(nested))
+  assert.equal(outer.unresolved.length, 0)
+  assert.equal(outer.blocks.length, 2)
+  assert.deepEqual(outer.blocks.map((block) => [block.startLine, block.endLine]), [[1, 4], [2, 3]])
+
+  const mismatchedIndent = [
+    `// dsh-debug:probe ${HASH} uid=b1 start`,
+    '  probe(1)',
+    `    // dsh-debug:probe ${HASH} uid=b1 end`,
+  ].join('\n')
+  const indented = pairBlocks(findMarkers(mismatchedIndent))
+  assert.equal(indented.unresolved.length, 0, '带 uid 后缩进不一致不再算歧义')
+  assert.equal(indented.blocks.length, 1)
+
+  const interleaved = [
+    `// dsh-debug:probe ${HASH} uid=b1 start`,
+    `// dsh-debug:probe ${HASH} uid=b2 start`,
+    `// dsh-debug:probe ${HASH} uid=b1 end`,
+    `// dsh-debug:probe ${HASH} uid=b2 end`,
+  ].join('\n')
+  const crossed = pairBlocks(findMarkers(interleaved))
+  assert.equal(crossed.unresolved.length, 0, '不同 uid 的交错块合法')
+  assert.equal(crossed.blocks.length, 2)
+})
+
+test('pairBlocks 带 uid 的残缺标记进 unresolved：重复 start、缺 end、uid/hash 不一致', () => {
+  const cases = [
+    {
+      text: [
+        `// dsh-debug:probe ${HASH} uid=b1 start`,
+        `// dsh-debug:probe ${HASH} uid=b1 start`,
+        `// dsh-debug:probe ${HASH} uid=b1 end`,
+      ].join('\n'),
+      reason: /2 个 start/,
+    },
+    {
+      text: `// dsh-debug:probe ${HASH} uid=b1 start\nprobe(1)`,
+      reason: /没有配对的 end|0 个 end/,
+    },
+    {
+      text: `// dsh-debug:probe ${HASH} uid=b1 start\n// dsh-debug:probe ${HASH} uid=b2 end`,
+      reason: /0 个 start|0 个 end/,
+    },
+    {
+      text: `// dsh-debug:probe ${HASH} uid=b1 start\n// dsh-debug:probe ${OTHER} uid=b1 end`,
+      reason: /0 个 start|0 个 end/,
+    },
+  ]
+  for (const { text, reason } of cases) {
+    const result = pairBlocks(findMarkers(text))
+    assert.equal(result.blocks.length, 0)
+    assert.ok(result.unresolved.some((entry) => reason.test(entry.reason)),
+      `应进 unresolved：${text}`)
+  }
+})
+
+test('pairBlocks 带 uid 与无 uid 标记混用时两路互不干扰', () => {
+  const text = [
+    `// dsh-debug:probe ${HASH} start`,
+    `// dsh-debug:probe ${HASH} uid=b1 start`,
+    `// dsh-debug:probe ${HASH} uid=b1 end`,
+    `// dsh-debug:probe ${HASH} end`,
+  ].join('\n')
+  const result = pairBlocks(findMarkers(text))
+  assert.equal(result.unresolved.length, 0)
+  assert.deepEqual(result.blocks.map((block) => [block.startLine, block.endLine]), [[1, 4], [2, 3]])
+})
+
+test('嵌套 uid 块整块摘除按行去重，同行 uid 标记保留原行', () => {
+  const nested = [
+    `// dsh-debug:probe ${HASH} uid=b1 start`,
+    `// dsh-debug:probe ${HASH} uid=b2 start`,
+    "probe('inner')",
+    `// dsh-debug:probe ${HASH} uid=b2 end`,
+    `// dsh-debug:probe ${HASH} uid=b1 end`,
+  ].join('\n')
+  const result = removeMarkers(nested, HASH)
+  assert.equal(result.text, '')
+  assert.equal(result.removed.length, 1, '嵌套块合并成一个摘除区间')
+  assert.equal(result.removed[0].startLine, 1)
+  assert.equal(result.removed[0].endLine, 5)
+
+  const inline = `doThing(); // dsh-debug:probe ${HASH} uid=b1 start\n// dsh-debug:probe ${HASH} uid=b1 end`
+  const inlineResult = removeMarkers(inline, HASH)
+  assert.deepEqual(inlineResult.removed, [])
+  assert.ok(inlineResult.unresolved.some((entry) => /同行/.test(entry.reason)))
+  assert.equal(inlineResult.text, inline)
+})
+
+test('旧格式块（无 uid）的摘除行为与加 uid 后一致', () => {
+  const plain = `// dsh-debug:probe ${HASH} start\nprobe(1)\n// dsh-debug:probe ${HASH} end\nconst keep = 1`
+  const withUid = `// dsh-debug:probe ${HASH} uid=b1 start\nprobe(1)\n// dsh-debug:probe ${HASH} uid=b1 end\nconst keep = 1`
+  const before = removeMarkers(plain, HASH)
+  const after = removeMarkers(withUid, HASH)
+  assert.equal(after.text, before.text)
+  assert.deepEqual(after.removed.map(({ kind, startLine, endLine }) => ({ kind, startLine, endLine })),
+    before.removed.map(({ kind, startLine, endLine }) => ({ kind, startLine, endLine })))
 })
 
 test('introducedIdentifiers 提取块里新引入的名字，并跳过桩自带的公开名', () => {
