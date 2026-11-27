@@ -389,6 +389,58 @@ test('路由 GET /stub.js：活跃任务 200 + JS + 烘死的哈希与端点；�
   }
 })
 
+test('无 Peer 的通道：/probe 与 /stub.js 匿名准入，投递与 GET 自检都通；面板三条仍要求认证', async () => {
+  const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
+  const art = await createArtifactBase()
+  const fake = createFakeContext({ cwd: workspace.root, webPort: 19387 })
+  const service = new DebugService(fake.ctx, { logger: fake.ctx.logger, tempDir: art.base })
+  const previousWebUrl = process.env.DSH_WEB_URL
+  delete process.env.DSH_WEB_URL
+  try {
+    registerRoutes(fake.ctx, service)
+    await service.issueTicket({ sessionId: SESSION, text: 'x', workspace: workspace.root })
+    const started = await service.start({ sessionId: SESSION, goal: 'x', workspace: workspace.root })
+    assert.equal(started.ok, true, started.text)
+
+    const byPath = (path) => fake.routes.find((route) => route.path === `${ROUTE_PREFIX}${path}`)
+    // 宿主对没有声明 auth 的路由按 `required` 处理：没有 Peer 就不进 handler（401/503）。
+    // 探针通道的调用方（跨源页面、file://、外部进程）都没有 DSH 凭据，所以放行与否
+    // 只由这里的声明决定。
+    assert.equal(byPath('/probe').auth, 'anonymous')
+    assert.equal(byPath('/stub.js').auth, 'anonymous')
+    for (const path of ['/state', '/board', '/resolve', '/reproduce']) {
+      assert.equal(byPath(path).auth, undefined, `${path} 是面板路由，必须保持默认 required`)
+    }
+
+    // 不传 handler 的第三个参数 = 没有准入 Peer；处理逻辑照样要走完。
+    const post = fakeHttp({
+      method: 'POST',
+      url: `${ROUTE_PREFIX}/probe?h=${started.hash}`,
+      body: { probe: 'buggy-demo.html:9:add' },
+    })
+    byPath('/probe').handler(post.req, post.res)
+    const ingested = await post.deliver()
+    assert.equal(ingested.status, 200)
+    assert.equal(ingested.json.accepted, 1, '无 Peer 也要能把记录投进来')
+
+    const selfCheck = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/probe?h=${started.hash}` })
+    byPath('/probe').handler(selfCheck.req, selfCheck.res)
+    const checked = await selfCheck.deliver()
+    assert.equal(checked.status, 200, 'GET 自检是投递方唯一的依据，必须在无凭据通道上可用')
+    assert.equal(checked.json.ok, true)
+    assert.equal(checked.json.httpRecords, 1)
+
+    const stub = fakeHttp({ method: 'GET', url: `${ROUTE_PREFIX}/stub.js?h=${started.hash}` })
+    byPath('/stub.js').handler(stub.req, stub.res)
+    assert.equal((await stub.deliver()).status, 200, '<script src> 取桩同样不带凭据')
+  } finally {
+    if (previousWebUrl === undefined) delete process.env.DSH_WEB_URL
+    else process.env.DSH_WEB_URL = previousWebUrl
+    await workspace.cleanup()
+    await art.cleanup()
+  }
+})
+
 test('路由：/reproduce 把用户选择变成 Agent 的下一轮输入（并保持幂等）', async () => {
   const workspace = await createWorkspace({ 'src/app.js': 'export const a = 1\n' })
   const art = await createArtifactBase()
