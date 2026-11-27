@@ -197,10 +197,12 @@ async function postSignal(signal, input) {
  * 每个 `var()` 都带 fallback：令牌改名时最坏结果是外观退化，而不是面板不可读。
  */
 const CSS = [
-  // 卡片本体：宽高跟随 composer 卡片，居中——看起来才像"贴在输入框上方"，
-  // 而不是一条横穿整个窗口的横幅。
-  '.dsh-dbg{box-sizing:border-box;width:100%;',
-  'max-width:var(--dsh-composer-card-max-width,100%);margin:0 auto 6px;',
+  // 卡片本体：与输入框同宽并居中——宽度扣掉两侧 clearance 与 dock inset，
+  // 看起来才像"贴在输入框上方"，而不是一条横穿整个窗口的横幅。
+  '.dsh-dbg{box-sizing:border-box;',
+  'width:calc(100% - 2 * var(--dsh-composer-side-clearance, 16px) - 4 * var(--dsh-composer-dock-inset, 8px));',
+  'max-width:calc(var(--dsh-composer-card-max-width, 912px) - 4 * var(--dsh-composer-dock-inset, 8px));',
+  'margin:0 auto 6px;',
   'border-radius:var(--dsw-radius-lg,10px);overflow:hidden;',
   'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.28));',
   'background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.06));',
@@ -250,10 +252,11 @@ const CSS = [
   // 用 `state-warn-tertiary` 底 + `state-warn-label` 字：这两个令牌明暗主题各有一套，
   // 无需自己判断 `prefers-color-scheme`。不用 `--dsw-alias-brand-primary`：
   // 它在浅色主题下解析成 near-black，字与底会同色。
-  '.dsh-dbg-chip{corner-shape:round;flex:none;display:inline-flex;align-items:center;gap:4px;',
-  'padding:2px 8px;border-radius:999px;font-size:13px;font-weight:500;line-height:20px;',
+  '.dsh-dbg-chip{corner-shape:round;flex:none;display:inline-flex;align-items:center;gap:6px;',
+  'padding:2px 10px;border-radius:999px;font-size:12px;font-weight:500;line-height:20px;',
   // 它是 button（叉要能点），所以把浏览器默认外观全部清掉，只留上面这套 chip 造型。
-  'appearance:none;border:none;font-family:inherit;cursor:pointer;',
+  'appearance:none;border:1px solid var(--dsw-alias-border,rgba(128,128,128,.35));',
+  'font-family:inherit;cursor:pointer;',
   'background:var(--dsw-alias-state-warn-tertiary,rgba(221,134,41,.16));',
   'color:var(--dsw-alias-state-warn-label,#dd8629);white-space:nowrap}',
   '.dsh-dbg-chip:hover:not(:disabled){color:var(--dsw-alias-state-warn-primary,#f59e0b)}',
